@@ -1,0 +1,236 @@
+"""
+Patient Service — DG Clinic WhatsApp Bot
+Database operations (Supabase) + WhatsApp response formatting.
+"""
+from datetime import date, datetime
+from typing import Optional
+from supabase import create_client, Client
+from app.config import get_settings
+from app.models.schemas import Patient, TreatmentLog, LogExtraction
+
+settings = get_settings()
+
+
+def _get_db() -> Client:
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATIENT LOOKUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def lookup_patient(name_query: str) -> tuple[list[Patient], Optional[dict]]:
+    """
+    Fuzzy-search patients by name using the Postgres pg_trgm function.
+    Returns (list_of_matches, latest_treatment_log_of_best_match).
+
+    The Supabase RPC call maps directly to the SQL function search_patient().
+    """
+    db = _get_db()
+
+    result = db.rpc(
+        "search_patient",
+        {"query": name_query, "similarity_threshold": 0.2},
+    ).execute()
+
+    if not result.data:
+        return [], None
+
+    patients = [Patient(**row) for row in result.data]
+    best = patients[0]
+
+    # Fetch the latest treatment log for the best match
+    log_result = (
+        db.table("treatment_logs")
+        .select("*")
+        .eq("patient_id", best.id)
+        .order("date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    latest_log = log_result.data[0] if log_result.data else None
+
+    return patients, latest_log
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TREATMENT LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_treatment_log(patient_id: str, extraction: LogExtraction) -> Optional[TreatmentLog]:
+    """
+    Insert a new treatment log row and return the saved record.
+    """
+    db = _get_db()
+
+    payload = {
+        "patient_id": patient_id,
+        "date": extraction.date or date.today().isoformat(),
+        "protocol": extraction.protocol,
+        "dosage": extraction.dosage,
+        "route": extraction.route,
+        "notes": extraction.notes,
+        "next_visit_date": extraction.next_visit_date,
+        "logged_by": "doctor",
+    }
+
+    result = db.table("treatment_logs").insert(payload).execute()
+    if result.data:
+        return TreatmentLog(**result.data[0])
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WHATSAPP MESSAGE FORMATTERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def format_patient_card(patient: Patient, latest_log: Optional[dict]) -> str:
+    """
+    Builds the WhatsApp patient profile card.
+    WhatsApp formatting: *bold*, _italic_, newlines only (no markdown tables).
+    """
+    lines = []
+
+    # ── Header ──
+    age_str = _calculate_age(patient.dob) if patient.dob else "?"
+    gender_str = patient.gender or "?"
+    vip_emoji = {"Platinum": "💎", "Gold": "🥇", "Silver": "🥈"}.get(patient.vip_tier, "⚪")
+
+    lines.append(f"🟢 *{patient.full_name}*  ·  {gender_str}  ·  {age_str}y")
+    lines.append(f"{vip_emoji} {patient.vip_tier} Member")
+
+    # ── Allergy Alert ──
+    if patient.allergies:
+        lines.append(f"\n⚠️ *ALLERGIES:* {patient.allergies}")
+
+    # ── Medical Notes ──
+    if patient.medical_notes:
+        lines.append(f"📋 {patient.medical_notes}")
+
+    # ── Latest Treatment ──
+    if latest_log:
+        lines.append("")
+        lines.append("*— Last Treatment —*")
+        log_date = _format_date(latest_log.get("date"))
+        protocol  = latest_log.get("protocol", "")
+        dosage    = latest_log.get("dosage", "")
+        route     = latest_log.get("route", "")
+        notes     = latest_log.get("notes", "")
+
+        lines.append(f"📌 {protocol} {dosage} {route}".strip())
+        lines.append(f"🗓  {log_date}")
+        if notes:
+            lines.append(f"💬 {notes}")
+
+        # ── Next Visit ──
+        next_date = latest_log.get("next_visit_date")
+        if next_date:
+            days_delta = _days_from_today(next_date)
+            lines.append("")
+            lines.append("*— Next Session —*")
+            if days_delta < 0:
+                lines.append(f"🔴 {_format_date(next_date)} — *OVERDUE {abs(days_delta)} days*")
+            elif days_delta == 0:
+                lines.append(f"🔴 *TODAY*")
+            elif days_delta <= 3:
+                lines.append(f"🟡 {_format_date(next_date)} (in {days_delta} days)")
+            else:
+                lines.append(f"📅 {_format_date(next_date)} (in {days_delta} days)")
+    else:
+        lines.append("\n_No treatment records yet._")
+
+    lines.append("\n_Reply: /log [name] to add a treatment_")
+    return "\n".join(lines)
+
+
+def format_multi_match(patients: list[Patient]) -> str:
+    """When more than one patient matches the search query."""
+    lines = ["🔍 *Multiple patients found:*\n"]
+    for i, p in enumerate(patients[:4], 1):
+        age = _calculate_age(p.dob) if p.dob else "?"
+        lines.append(f"  {i}. {p.full_name}  ({p.gender or '?'}, {age}y)  [{p.vip_tier}]")
+    lines.append("\n_Reply with a more specific name to look up._")
+    return "\n".join(lines)
+
+
+def format_not_found(name_query: str) -> str:
+    return (
+        f"❌ No patient found matching *\"{name_query}\"*\n\n"
+        "• Check spelling or try nickname\n"
+        "• Type /help for available commands"
+    )
+
+
+def format_log_confirmation(patient: Patient, log: TreatmentLog) -> str:
+    """Confirmation message sent back after a treatment is logged."""
+    lines = [
+        f"✅ *Treatment logged*\n",
+        f"*Patient:* {patient.full_name}",
+        f"*Date:*    {_format_date(str(log.date))}",
+        f"*Protocol:* {log.protocol} {log.dosage or ''} {log.route or ''}".strip(),
+    ]
+    if log.notes:
+        lines.append(f"*Notes:*   {log.notes}")
+    if log.next_visit_date:
+        days = _days_from_today(str(log.next_visit_date))
+        lines.append(f"*Next:*    {_format_date(str(log.next_visit_date))} ({days} days)")
+    lines.append("\n_/undo to delete the last entry_")
+    return "\n".join(lines)
+
+
+def format_help() -> str:
+    return (
+        f"👋 *{settings.CLINIC_NAME} Doctor Assistant*\n\n"
+        "*Patient Lookup:*\n"
+        "  • Sita siapa?\n"
+        "  • Show me [name]\n"
+        "  • Gimana [name]?\n\n"
+        "*Log Treatment:*\n"
+        "  • Log [name]: [protocol] [dose] [route] hari ini\n"
+        "  • Catat Sita: Reta 10mg SC today, next 4 weeks\n\n"
+        "*Other:*\n"
+        "  • /help — show this menu\n\n"
+        "_Language: Indonesian & English both work_ 🇮🇩🇬🇧"
+    )
+
+
+def format_unknown() -> str:
+    return (
+        "🤔 Hmm, tidak yakin maksudnya.\n\n"
+        "Coba:\n"
+        "  • *Lookup:* \"Gimana Sita?\"\n"
+        "  • *Log:* \"Log Sita: Reta 10mg SC hari ini\"\n"
+        "  • */help* untuk daftar lengkap"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRIVATE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _calculate_age(dob) -> str:
+    if not dob:
+        return "?"
+    if isinstance(dob, str):
+        dob = datetime.fromisoformat(dob).date()
+    today = date.today()
+    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+    return str(age)
+
+
+def _format_date(date_str: Optional[str]) -> str:
+    if not date_str:
+        return "?"
+    try:
+        d = datetime.fromisoformat(str(date_str)).date()
+        return d.strftime("%-d %b %Y")                  # e.g. "12 Jun 2026"
+    except Exception:
+        return str(date_str)
+
+
+def _days_from_today(date_str: str) -> int:
+    try:
+        d = datetime.fromisoformat(str(date_str)).date()
+        return (d - date.today()).days
+    except Exception:
+        return 0
