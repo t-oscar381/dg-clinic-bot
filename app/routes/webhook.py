@@ -41,6 +41,14 @@ ACTIVE_PATIENT_TTL_MINUTES = 30
 # wrong person's visit against the wrong record.
 _pending_switch: dict[str, dict] = {}
 
+# ── Pending VISIT clarification ─────────────────────────────────────────────────
+# Key: sender_number  Value: extraction dict (the ORIGINAL partial narrative
+# extraction, e.g. patient_name="Dicky", protocol="Exosome" already known,
+# just missing dosage/route). BUGFIX: this dict did not exist before — a
+# VISIT clarification question was asked but nothing was remembered, so a
+# one-word reply like "5mg" arrived with zero context and always failed.
+_pending_visit: dict[str, dict] = {}
+
 # Words that signal "same patient as before" rather than a new name
 _CONTINUATION_WORDS = {
     "dia", "nya", "pasien tadi", "yang tadi", "itu", "beliau",
@@ -193,6 +201,11 @@ async def _handle_message(body: dict) -> None:
         await _handle_log_clarification(sender, text)
         return
 
+    # ── Check pending VISIT clarification ────────────────────────────────────
+    if sender in _pending_visit:
+        await _handle_visit_clarification(sender, text)
+        return
+
     # ── Check pending VISIT match confirmation ───────────────────────────────
     if sender in _pending_visit_match:
         await _handle_visit_match_reply(sender, text)
@@ -323,7 +336,17 @@ async def _handle_log(sender: str, text: str) -> None:
                 )
             return
 
-    # ── Find patient in DB ────────────────────────────────────────────────────
+    await _save_log_extraction(sender, extraction)
+
+
+async def _save_log_extraction(sender: str, extraction) -> None:
+    """
+    Shared save step used by BOTH the direct text-based LOG flow and the
+    clarification-merge flow. Taking an already-built extraction directly
+    (rather than re-parsing text) is the fix for a real bug: re-extracting
+    from a reconstructed text string was silently dropping dosage/route
+    that had already been merged in from a prior clarification turn.
+    """
     if not extraction.patient_name:
         await whatsapp.send_text(sender, "❓ Nama pasien tidak ditemukan di pesan.")
         return
@@ -358,35 +381,60 @@ async def _handle_log_clarification(sender: str, clarification_text: str) -> Non
     """
     Doctor has replied to a clarification question about an incomplete log.
     Merge the reply with the pending extraction and try again.
+
+    BUGFIX: previously only carried forward patient_name/protocol/date when
+    reconstructing context — dosage, route, and notes already confirmed in
+    earlier turns were silently dropped, causing the clarification loop to
+    lose progress and ask the doctor to start over. Now every known field
+    is passed forward as context AND used as a merge fallback.
     """
     pending = _pending_log.get(sender, {})
 
-    # Combine original message context with clarification
+    # Combine ALL previously known fields as context — not just name/protocol/date.
+    # This is what was missing before: dosage and route confirmed in an
+    # earlier turn must still be visible to the next extraction call.
+    known_parts = []
+    for field, label in [
+        ("patient_name", "Patient"), ("protocol", "Protocol"),
+        ("dosage", "Dosage"), ("route", "Route"), ("date", "Date"),
+        ("notes", "Notes"), ("next_visit_days", "Next visit in days"),
+    ]:
+        val = pending.get(field)
+        if val:
+            known_parts.append(f"{label}: {val}")
+
     combined_message = (
-        f"Original treatment note context: "
-        f"Patient: {pending.get('patient_name')}, "
-        f"Protocol: {pending.get('protocol')}, "
-        f"Date: {pending.get('date')}. "
+        f"Original treatment note context — {', '.join(known_parts)}. "
         f"Doctor replied with additional info: {clarification_text}"
     )
 
     # Re-extract with combined context
     extraction = claude_ai.extract_treatment_log(combined_message)
 
-    # Merge known fields from pending into new extraction
-    if not extraction.patient_name:
-        extraction.patient_name = pending.get("patient_name")
-    if not extraction.date:
-        extraction.date = pending.get("date")
-    if not extraction.protocol:
-        extraction.protocol = pending.get("protocol")
+    # Merge EVERY known field from pending into the new extraction if the
+    # new extraction didn't determine it — not just three of them.
+    for field in ["patient_name", "protocol", "dosage", "route", "date",
+                  "notes", "next_visit_days", "next_visit_date"]:
+        if not getattr(extraction, field, None) and pending.get(field):
+            setattr(extraction, field, pending.get(field))
+
+    # BUGFIX: extraction.is_complete reflects only what THIS API call saw,
+    # not the merged result above. Recompute it now that dosage/route/etc.
+    # from earlier turns have been filled back in — otherwise a fully
+    # complete record (after merge) still gets treated as incomplete and
+    # the doctor is asked to start over, even though nothing is missing.
+    extraction.is_complete = bool(
+        extraction.patient_name and extraction.protocol and extraction.date
+    )
 
     # Clear pending state
     del _pending_log[sender]
 
-    # Recurse into normal log handler
+    # Use the MERGED extraction object directly — do NOT re-extract from
+    # combined_message text, since that would silently discard the
+    # dosage/route we just manually restored from `pending` above.
     if extraction.is_complete:
-        await _handle_log(sender, combined_message)
+        await _save_log_extraction(sender, extraction)
     else:
         # Still missing data — give up gracefully
         await whatsapp.send_text(
@@ -439,6 +487,12 @@ async def _handle_visit(sender: str, text: str) -> None:
         question = extraction.clarification_question or (
             "❓ Siapa nama pasiennya? Ceritakan sedikit tentang visit-nya."
         )
+        # BUGFIX: previously nothing was saved here — a one-word reply like
+        # "5mg" to this question arrived with zero memory of the patient
+        # name/protocol already extracted, and always failed. Now the
+        # partial extraction is preserved so the next message can merge
+        # into it instead of starting from scratch.
+        _pending_visit[sender] = extraction.model_dump()
         await whatsapp.send_text(sender, question)
         return
 
@@ -463,6 +517,76 @@ async def _handle_visit(sender: str, text: str) -> None:
         return
 
     await _resolve_and_log_visit(sender, extraction)
+
+
+async def _handle_visit_clarification(sender: str, clarification_text: str) -> None:
+    """
+    Doctor replied to a VISIT clarification question (e.g. answered "5mg"
+    after being asked for dosage). Merges the reply into the ORIGINAL
+    partial extraction — patient_name, protocol, and any `extra` context
+    already gathered — rather than treating the reply as a brand-new,
+    contextless message. This is the fix for the exact bug reported: a
+    bare "5mg" or "Injeksi" reply used to fail because nothing was
+    remembered about the visit being discussed.
+    """
+    pending = _pending_visit.pop(sender, {})
+    pending_extraction = VisitExtraction(**pending)
+
+    # Build a context summary of everything already known, so the next
+    # extraction call can fill in just the missing piece intelligently.
+    known_parts = []
+    for field, label in [
+        ("patient_name", "Patient"), ("protocol", "Protocol"),
+        ("dosage", "Dosage"), ("route", "Route"), ("date", "Date"),
+        ("notes", "Notes"), ("allergies", "Allergies"),
+        ("vip_tier", "VIP tier"), ("medical_notes", "Medical notes"),
+    ]:
+        val = getattr(pending_extraction, field, None)
+        if val:
+            known_parts.append(f"{label}: {val}")
+    if pending_extraction.extra:
+        for k, v in pending_extraction.extra.items():
+            if v:
+                known_parts.append(f"{k.replace('_', ' ').capitalize()}: {v}")
+
+    combined_message = (
+        f"Original visit context — {', '.join(known_parts)}. "
+        f"Doctor replied with additional info: {clarification_text}"
+    )
+
+    new_extraction = claude_ai.extract_visit(combined_message)
+
+    # Merge every core field the new call didn't determine, falling back
+    # to what was already known from the pending extraction.
+    for field in ["patient_name", "nickname", "phone", "gender", "dob",
+                  "vip_tier", "allergies", "medical_notes",
+                  "date", "protocol", "dosage", "route", "notes",
+                  "next_visit_days", "next_visit_date"]:
+        if not getattr(new_extraction, field, None):
+            old_val = getattr(pending_extraction, field, None)
+            if old_val:
+                setattr(new_extraction, field, old_val)
+
+    # Merge extra dicts (new values win on key collision, old ones fill gaps)
+    merged_extra = dict(pending_extraction.extra or {})
+    merged_extra.update(new_extraction.extra or {})
+    new_extraction.extra = merged_extra
+
+    # Recompute completeness now that merged fields are in place
+    new_extraction.is_complete = bool(
+        new_extraction.patient_name and new_extraction.protocol
+    )
+
+    if not new_extraction.is_complete:
+        # Still missing something — ask again, keeping state alive
+        _pending_visit[sender] = new_extraction.model_dump()
+        question = new_extraction.clarification_question or (
+            "❓ Masih ada info yang kurang. Bisa dilengkapi?"
+        )
+        await whatsapp.send_text(sender, question)
+        return
+
+    await _resolve_and_log_visit(sender, new_extraction)
 
 
 async def _resolve_and_log_visit(sender: str, extraction: VisitExtraction) -> None:
