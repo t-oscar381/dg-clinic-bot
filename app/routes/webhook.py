@@ -19,7 +19,7 @@ _pending_log: dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GET /webhook — Meta verificationgit add app/routes/webhook.py
+# GET /webhook — Meta verification
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/webhook")
@@ -32,8 +32,22 @@ async def verify_webhook(
     Meta calls this URL when you first register the webhook in the developer portal.
     Must respond with hub.challenge if the verify token matches.
     """
-    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
+    # Log what we received for debugging
+    import sys
+    expected = settings.WHATSAPP_VERIFY_TOKEN
+    print(f"\n[WEBHOOK_VERIFY_DEBUG]", file=sys.stderr)
+    print(f"  Received token: {repr(hub_verify_token)} (len={len(hub_verify_token) if hub_verify_token else 0})", file=sys.stderr)
+    print(f"  Expected token: {repr(expected)} (len={len(expected)})", file=sys.stderr)
+    print(f"  hub_mode: {repr(hub_mode)}", file=sys.stderr)
+    print(f"  hub_challenge: {repr(hub_challenge)}", file=sys.stderr)
+    print(f"  Match: {hub_verify_token == expected}", file=sys.stderr)
+    
+    # Check token — mode is optional for this test
+    if hub_verify_token == expected and hub_challenge:
+        print(f"  ✓ VERIFIED - returning challenge", file=sys.stderr)
         return PlainTextResponse(hub_challenge)
+    
+    print(f"  ✗ FAILED", file=sys.stderr)
     raise HTTPException(status_code=403, detail="Verify token mismatch")
 
 
