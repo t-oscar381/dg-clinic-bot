@@ -51,19 +51,19 @@ class LogExtraction(BaseModel):
 class VisitExtraction(BaseModel):
     """
     Extracted from a doctor's natural narrative about a patient visit.
-    Covers BOTH identity info (for matching/creating patient)
-    AND visit info (for logging the treatment), in one pass.
+    CORE fields are fixed and validated — the bot's logic depends on them.
+    Everything else the doctor mentions goes into `extra` as open key-value
+    pairs (Cekat-style), stored in JSONB — no schema changes needed as the
+    doctor's narration style evolves.
     """
-    # ── Identity fields — used to match or create the patient ──────────────
+    # ── CORE identity — used to match or create the patient ─────────────────
     patient_name: Optional[str] = None
     nickname: Optional[str] = None
     phone: Optional[str] = None
     gender: Optional[str] = None
     dob: Optional[str] = None
-    location: Optional[str] = None          # where the visit happened (home/hotel/office)
-    referral_source: Optional[str] = None   # how the patient found the clinic
 
-    # ── Visit / treatment fields ─────────────────────────────────────────────
+    # ── CORE visit / treatment ────────────────────────────────────────────────
     date: Optional[str] = None
     protocol: Optional[str] = None
     dosage: Optional[str] = None
@@ -71,6 +71,12 @@ class VisitExtraction(BaseModel):
     notes: Optional[str] = None
     next_visit_days: Optional[int] = None
     next_visit_date: Optional[str] = None
+
+    # ── OPEN catch-all — anything else important the doctor mentioned ────────
+    # e.g. {"location": "Senopati", "payment": "3500000",
+    #       "risk_factors": "travel to Malaysia, possible fever",
+    #       "accompanying": "husband and child", "travel_distance": "15km by car"}
+    extra: dict = {}
 
     is_complete: bool = False
     missing_fields: list[str] = []

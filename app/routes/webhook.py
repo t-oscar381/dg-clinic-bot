@@ -378,7 +378,17 @@ async def _log_visit_to_patient(
     """
     from app.models.schemas import LogExtraction
 
-    # VisitExtraction and LogExtraction share the treatment fields —
+    # ── Fold the OPEN extra dict into the note text ──────────────────────────
+    # treatment_logs.extra (JSONB) stores it structured too, so nothing here
+    # is lost even as the doctor's narration style evolves over time.
+    note_parts = [extraction.notes] if extraction.notes else []
+    for key, value in (extraction.extra or {}).items():
+        if value:
+            label = key.replace("_", " ").capitalize()
+            note_parts.append(f"{label}: {value}")
+    combined_notes = " | ".join(note_parts) if note_parts else extraction.notes
+
+    # VisitExtraction and LogExtraction share the core treatment fields —
     # reuse save_treatment_log() by converting.
     log_extraction = LogExtraction(
         patient_name=patient.full_name,
@@ -386,7 +396,7 @@ async def _log_visit_to_patient(
         protocol=extraction.protocol,
         dosage=extraction.dosage,
         route=extraction.route,
-        notes=extraction.notes,
+        notes=combined_notes,
         next_visit_days=extraction.next_visit_days,
         next_visit_date=extraction.next_visit_date,
         is_complete=True,
@@ -394,10 +404,12 @@ async def _log_visit_to_patient(
 
     saved_log = None
     if extraction.protocol:  # only log if there's actually a treatment described
-        saved_log = patient_svc.save_treatment_log(patient.id, log_extraction)
+        saved_log = patient_svc.save_treatment_log(
+            patient.id, log_extraction, extra=extraction.extra
+        )
 
     if is_new:
-        confirmation = patient_svc.format_new_patient_confirmation(patient, saved_log)
+        confirmation = patient_svc.format_new_patient_confirmation(patient, saved_log, extraction)
     elif saved_log:
         confirmation = patient_svc.format_log_confirmation(patient, saved_log)
     else:

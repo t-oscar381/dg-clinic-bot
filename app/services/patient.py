@@ -57,9 +57,15 @@ def lookup_patient(name_query: str) -> tuple[list[Patient], Optional[dict]]:
 # TREATMENT LOGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_treatment_log(patient_id: str, extraction: LogExtraction) -> Optional[TreatmentLog]:
+def save_treatment_log(
+    patient_id: str,
+    extraction: LogExtraction,
+    extra: Optional[dict] = None,
+) -> Optional[TreatmentLog]:
     """
     Insert a new treatment log row and return the saved record.
+    `extra` is an OPEN dict (Cekat-style) for anything the doctor mentioned
+    that doesn't fit a fixed column — stored as JSONB, no schema change needed.
     """
     db = _get_db()
 
@@ -73,10 +79,12 @@ def save_treatment_log(patient_id: str, extraction: LogExtraction) -> Optional[T
         "next_visit_date": extraction.next_visit_date,
         "logged_by": "doctor",
     }
+    if extra:
+        payload["extra"] = extra
 
     result = db.table("treatment_logs").insert(payload).execute()
     if result.data:
-        return TreatmentLog(**result.data[0])
+        return TreatmentLog(**{k: v for k, v in result.data[0].items() if k != "extra"})
     return None
 
 
@@ -268,8 +276,13 @@ def format_log_confirmation(patient: Patient, log: TreatmentLog) -> str:
     return "\n".join(lines)
 
 
-def format_new_patient_confirmation(patient: Patient, log: Optional[TreatmentLog]) -> str:
-    """Confirmation when a brand-new patient was created from a visit narrative."""
+def format_new_patient_confirmation(patient: Patient, log: Optional[TreatmentLog], extraction=None) -> str:
+    """
+    Confirmation when a brand-new patient was created from a visit narrative.
+    Reads `extraction.extra` — an OPEN dict of whatever the doctor mentioned
+    that didn't fit a core field. No fixed list of keys; renders whatever
+    is present, in the order Claude returned them.
+    """
     lines = [
         "🆕 *New patient created*\n",
         f"*Name:* {patient.full_name}",
@@ -289,6 +302,44 @@ def format_new_patient_confirmation(patient: Patient, log: Optional[TreatmentLog
             lines.append(f"💬 {log.notes}")
         if log.next_visit_date:
             lines.append(f"📅 Next: {_format_date(str(log.next_visit_date))}")
+
+    # ── OPEN extra fields — render whatever the doctor mentioned ─────────────
+    extra = getattr(extraction, "extra", None) if extraction else None
+    if extra:
+        lines.append("")
+        icon_map = {
+            "risk_factors": "⚠️",
+            "vitals_checked": "✅",
+            "vitals_not_checked_reason": "⏭️",
+            "accompanying_people": "👥",
+            "location": "📍",
+            "travel_distance": "🚗",
+            "payment_amount": "💰",
+            "payment_notes": "💬",
+            "referral_source": "🔗",
+        }
+        label_map = {
+            "risk_factors": "Risk factors",
+            "vitals_checked": "Vitals",
+            "vitals_not_checked_reason": "Not checked",
+            "accompanying_people": "Accompanying",
+            "location": "Location",
+            "travel_distance": "Distance",
+            "payment_amount": "Payment",
+            "payment_notes": "Payment note",
+            "referral_source": "Referral",
+        }
+        for key, value in extra.items():
+            if not value:
+                continue
+            icon = icon_map.get(key, "•")
+            label = label_map.get(key, key.replace("_", " ").title())
+            if key == "payment_amount":
+                try:
+                    value = f"Rp {int(value):,}".replace(",", ".")
+                except (ValueError, TypeError):
+                    pass
+            lines.append(f"{icon} *{label}:* {value}")
 
     lines.append("\n_Reply to add more details (VIP tier, allergies, etc.)_")
     return "\n".join(lines)
