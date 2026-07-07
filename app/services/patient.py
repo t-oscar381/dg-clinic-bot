@@ -10,6 +10,35 @@ from app.models.schemas import Patient, TreatmentLog, LogExtraction, VisitExtrac
 
 settings = get_settings()
 
+# ── Shared rendering maps for the OPEN `extra` dict ─────────────────────────
+# Used by BOTH format_new_patient_confirmation() and format_patient_card(),
+# so a lookup always shows the same icons/labels as the original visit
+# confirmation did — no drift between "just logged" and "looked up later".
+# Add new keys here anytime; anything not listed falls back to a bullet "•"
+# and a title-cased version of the key, so nothing ever fails to render.
+_EXTRA_ICON_MAP = {
+    "risk_factors": "⚠️",
+    "vitals_checked": "✅",
+    "vitals_not_checked_reason": "⏭️",
+    "accompanying_people": "👥",
+    "location": "📍",
+    "travel_distance": "🚗",
+    "payment_amount": "💰",
+    "payment_notes": "💬",
+    "referral_source": "🔗",
+}
+_EXTRA_LABEL_MAP = {
+    "risk_factors": "Risk factors",
+    "vitals_checked": "Vitals",
+    "vitals_not_checked_reason": "Not checked",
+    "accompanying_people": "Accompanying",
+    "location": "Location",
+    "travel_distance": "Distance",
+    "payment_amount": "Payment",
+    "payment_notes": "Payment note",
+    "referral_source": "Referral",
+}
+
 
 def _get_db() -> Client:
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
@@ -137,6 +166,9 @@ def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
     """
     Create a new patient record from visit-narrative identity fields.
     Called when match_patient_from_visit() returns NONE.
+    `referral_source` moved into the open `extra` dict during the schema
+    redesign — read it from there now, since it's no longer a fixed field
+    on VisitExtraction.
     """
     db = _get_db()
 
@@ -146,7 +178,7 @@ def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
         "dob": extraction.dob,
         "gender": extraction.gender,
         "phone": extraction.phone,
-        "referral_source": extraction.referral_source,
+        "referral_source": (extraction.extra or {}).get("referral_source"),
         "vip_tier": "Standard",     # default — doctor can update later
         "is_active": True,
     }
@@ -210,15 +242,34 @@ def format_patient_card(patient: Patient, latest_log: Optional[dict]) -> str:
         lines.append("")
         lines.append("*— Last Treatment —*")
         log_date = _format_date(latest_log.get("date"))
-        protocol  = latest_log.get("protocol", "")
-        dosage    = latest_log.get("dosage", "")
-        route     = latest_log.get("route", "")
-        notes     = latest_log.get("notes", "")
+        protocol  = latest_log.get("protocol") or ""
+        dosage    = latest_log.get("dosage") or ""
+        route     = latest_log.get("route") or ""
+        notes     = latest_log.get("notes") or ""
 
         lines.append(f"📌 {protocol} {dosage} {route}".strip())
         lines.append(f"🗓  {log_date}")
         if notes:
             lines.append(f"💬 {notes}")
+
+        # ── Open extra context from the visit (risk factors, payment, etc.) ──
+        # Same rendering logic as format_new_patient_confirmation, so a
+        # lookup shows exactly what a visit confirmation showed originally —
+        # nothing the doctor mentioned is lost between logging and lookup.
+        extra = latest_log.get("extra") or {}
+        if extra:
+            lines.append("")
+            for key, value in extra.items():
+                if not value:
+                    continue
+                icon = _EXTRA_ICON_MAP.get(key, "•")
+                label = _EXTRA_LABEL_MAP.get(key, key.replace("_", " ").title())
+                if key == "payment_amount":
+                    try:
+                        value = f"Rp {int(value):,}".replace(",", ".")
+                    except (ValueError, TypeError):
+                        pass
+                lines.append(f"{icon} *{label}:* {value}")
 
         # ── Next Visit ──
         next_date = latest_log.get("next_visit_date")
@@ -307,33 +358,11 @@ def format_new_patient_confirmation(patient: Patient, log: Optional[TreatmentLog
     extra = getattr(extraction, "extra", None) if extraction else None
     if extra:
         lines.append("")
-        icon_map = {
-            "risk_factors": "⚠️",
-            "vitals_checked": "✅",
-            "vitals_not_checked_reason": "⏭️",
-            "accompanying_people": "👥",
-            "location": "📍",
-            "travel_distance": "🚗",
-            "payment_amount": "💰",
-            "payment_notes": "💬",
-            "referral_source": "🔗",
-        }
-        label_map = {
-            "risk_factors": "Risk factors",
-            "vitals_checked": "Vitals",
-            "vitals_not_checked_reason": "Not checked",
-            "accompanying_people": "Accompanying",
-            "location": "Location",
-            "travel_distance": "Distance",
-            "payment_amount": "Payment",
-            "payment_notes": "Payment note",
-            "referral_source": "Referral",
-        }
         for key, value in extra.items():
             if not value:
                 continue
-            icon = icon_map.get(key, "•")
-            label = label_map.get(key, key.replace("_", " ").title())
+            icon = _EXTRA_ICON_MAP.get(key, "•")
+            label = _EXTRA_LABEL_MAP.get(key, key.replace("_", " ").title())
             if key == "payment_amount":
                 try:
                     value = f"Rp {int(value):,}".replace(",", ".")
