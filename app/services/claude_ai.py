@@ -112,20 +112,23 @@ much more than just a treatment — travel logistics, family members present,
 symptoms noticed, partial vitals, payment, and more.
 
 You extract two kinds of information:
-1. CORE fields (patient_name, protocol, dosage, route, date, next_visit) —
-   these are fixed and the bot's logic depends on them being named exactly
-   as specified below.
-2. EXTRA fields — literally anything else important the doctor mentions that
-   doesn't fit a core field. Put these in the `extra` object as free-form
-   key-value pairs, using short snake_case keys you choose based on what
-   the doctor said. This is OPEN — there is no fixed list of allowed keys.
-   Never discard information just because it doesn't fit a core field;
-   put it in `extra` instead, using a key that clearly names what it is.
+1. CORE fields (patient_name, protocol, dosage, route, date, next_visit,
+   AND allergies, medical_notes, vip_tier) — these are fixed and important
+   enough to always populate exactly as specified below. allergies and
+   medical_notes are safety-critical — always extract them to the CORE
+   field if mentioned, never bury them only in `extra` or `notes`.
+2. EXTRA fields — literally anything else important the doctor mentions
+   that doesn't fit a core field (location, payment, risk factors, referral
+   source, travel details, accompanying people, etc.). Put these in the
+   `extra` object as free-form key-value pairs, using short snake_case keys
+   you choose based on what the doctor said. This is OPEN — no fixed list.
 
 CLINIC CONTEXT:
 - Common protocols: Retatrutide, Tirzepatide, Semaglutide, NAD+ IV, Glutathione IV,
   Vitamin C IV, Diamond Booster, Exosome, PRP, Health Screening, Executive Reset
 - Common routes: SC, IV, IM, PO, Topical
+- vip_tier must be exactly one of: Standard, Silver, Gold, Platinum (map
+  casual mentions like "VIP platinum" or "member gold" to these exact values)
 - Visits happen at patient's home, hotel, or office
 - Patients are often accompanied by family who may ALSO receive treatment
 - Payment is often mentioned in Indonesian Rupiah shorthand, e.g. "3.5 juta"
@@ -133,50 +136,65 @@ CLINIC CONTEXT:
 
 REAL EXAMPLE — study this pattern carefully:
 
-  Input: "Pasien Arjuna tinggal di Senopati. Kesana dengan mobil 15km.
-  Ambil Diamond booster 3x (bersama suami, anak). Dia ada kemungkinan sakit
-  Demam karena habis jalan-jalan ke Malaysia. Tekanan Darah, BB Normal untuk
-  Pasien, keluarga lainnya tidak dicek karena tidak ada waktu. Setelah ini
-  akan kita follow up minggu depan. Mereka membayar 3.5 juta"
+  Input: "Pasien baru namanya Kirana Wijaya, nomor HP 081234567890, umur
+  sekitar 42 tahun, perempuan, alamat di Pondok Indah, VIP platinum, dia
+  direferensikan oleh pasien lama namanya Sita. Kirana ada alergi Penicillin
+  dan riwayat darah tinggi. Kesana naik motor 8km, cuma 10 menit. Ambil
+  Exosome treatment 2 vial IV, sambil ngobrol dia bilang lagi capek karena
+  kerja lembur terus di kantor, sepertinya kurang tidur. Tensi 130/85, berat
+  58kg, semua normal. Bayar cash 5.2 juta, sudah lunas. Follow up 3 minggu
+  lagi untuk cek progress."
 
   Correct extraction:
   {{
-    "patient_name": "Arjuna",
-    "protocol": "Diamond Booster",
-    "dosage": "3x",
-    "notes": null,
-    "next_visit_days": 7,
+    "patient_name": "Kirana Wijaya",
+    "phone": "081234567890",
+    "gender": "F",
+    "vip_tier": "Platinum",
+    "allergies": "Penicillin",
+    "medical_notes": "Hypertension (riwayat darah tinggi)",
+    "protocol": "Exosome",
+    "dosage": "2 vial",
+    "route": "IV",
+    "notes": "Reports fatigue from work overtime, possible sleep deprivation",
+    "next_visit_days": 21,
     "extra": {{
-      "location": "Senopati",
-      "travel_distance": "15km by car",
-      "risk_factors": "Possible fever - recently traveled to Malaysia",
-      "vitals_checked": "Blood pressure and weight normal for patient",
-      "vitals_not_checked_reason": "Family members not checked due to time",
-      "accompanying_people": "Husband and child also present, also treated",
-      "payment_amount": "3500000",
-      "payment_notes": "Paid by family for the group visit"
+      "location": "Pondok Indah",
+      "referral_source": "Sita (existing patient)",
+      "travel_mode": "Motorcycle",
+      "travel_distance": "8km",
+      "travel_time": "10 minutes",
+      "vitals_bp": "130/85",
+      "vitals_weight": "58kg",
+      "vitals_assessment": "All normal",
+      "payment_amount": "5200000",
+      "payment_method": "Cash",
+      "payment_status": "Fully paid"
     }},
     "is_complete": true
   }}
 
-  Notice: only ARJUNA becomes the primary patient record. Family members are
-  preserved in `extra.accompanying_people` as a note, not auto-created as
-  separate patients — the doctor didn't give enough identifying detail
-  (names, DOB) to safely create their own records. If the doctor DOES name
-  a family member with enough detail, that's a separate visit message.
+  Notice: allergies, medical_notes, and vip_tier are CORE fields even
+  though most of the message is about the visit itself — they're
+  extracted precisely, not folded into a sentence in `extra`.
 
 EXTRACTION RULES:
 1. Identify ONE primary patient per message — whoever is the clear subject.
-2. Use short, descriptive snake_case keys in `extra` — be consistent with
+2. allergies and medical_notes are SAFETY-CRITICAL — always put them in
+   the core fields if mentioned, even briefly. Never fold them only into
+   `extra` or `notes` where a lookup might miss them.
+3. vip_tier must be exactly "Standard", "Silver", "Gold", or "Platinum" —
+   map casual phrasing to these exact values, or leave null if not mentioned.
+4. Use short, descriptive snake_case keys in `extra` — be consistent with
    naming so similar concepts get the same key across messages when possible
    (e.g. always "payment_amount", not sometimes "cost" and sometimes "fee").
-3. Never guess or infer medical conclusions (e.g. don't diagnose "dengue"
+5. Never guess or infer medical conclusions (e.g. don't diagnose "dengue"
    from "demam" + travel) — preserve the doctor's own words in extra instead.
-4. If "today"/"hari ini"/"tadi" appears, use today's date: {today}.
+6. If "today"/"hari ini"/"tadi" appears, use today's date: {today}.
    Compute next_visit_date = today + next_visit_days if mentioned.
-5. Required for is_complete=true: patient_name AND protocol at minimum.
-6. If patient_name is missing entirely, is_complete = false and ask for it.
-7. Write clarification_question in the SAME language the doctor used.
+7. Required for is_complete=true: patient_name AND protocol at minimum.
+8. If patient_name is missing entirely, is_complete = false and ask for it.
+9. Write clarification_question in the SAME language the doctor used.
 
 Return ONLY valid JSON — no markdown, no explanation:
 {{
@@ -185,6 +203,9 @@ Return ONLY valid JSON — no markdown, no explanation:
   "phone": "string or null",
   "gender": "M|F|null",
   "dob": "YYYY-MM-DD or null",
+  "vip_tier": "Standard|Silver|Gold|Platinum|null",
+  "allergies": "string or null",
+  "medical_notes": "string or null",
   "date": "YYYY-MM-DD or null",
   "protocol": "string or null",
   "dosage": "string or null",
@@ -207,8 +228,13 @@ Return ONLY valid JSON — no markdown, no explanation:
 def classify_intent(message: str) -> IntentResult:
     """
     Step 1 of every incoming message.
-    Returns what the doctor wants (LOOKUP / LOG / HELP / UNKNOWN)
+    Returns what the doctor wants (LOOKUP / LOG / VISIT / HELP / UNKNOWN)
     and any patient name extracted.
+
+    If the Anthropic API call fails because of an exhausted credit balance,
+    this returns intent="BILLING_ERROR" instead of silently falling back to
+    UNKNOWN — an insufficient-balance failure should never look like the
+    bot simply "didn't understand" a normal message to the doctor.
     """
     try:
         response = client.messages.create(
@@ -224,7 +250,14 @@ def classify_intent(message: str) -> IntentResult:
         _log_token_usage(response.usage)
         return IntentResult(**data)
 
-    except (json.JSONDecodeError, Exception) as e:
+    except anthropic.APIStatusError as e:
+        if settings.DEBUG:
+            print(f"[classify_intent] Anthropic API error: {e}")
+        if _is_insufficient_balance(e):
+            return IntentResult(intent="BILLING_ERROR", reason=str(e))
+        return IntentResult(intent="UNKNOWN", reason=str(e))
+
+    except Exception as e:
         if settings.DEBUG:
             print(f"[classify_intent] error: {e}")
         return IntentResult(intent="UNKNOWN", reason=str(e))
@@ -302,6 +335,23 @@ def extract_visit(message: str) -> VisitExtraction:
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _is_insufficient_balance(error: "anthropic.APIStatusError") -> bool:
+    """
+    Detects Anthropic's specific "credit balance too low" error so the
+    doctor sees a clear billing message instead of a generic "I don't
+    understand" reply. Checks both the structured error type and the
+    message text, since APIStatusError shape can vary by SDK version.
+    """
+    try:
+        body = getattr(error, "body", None) or {}
+        err_type = (body.get("error") or {}).get("type", "")
+        if "insufficient_balance" in err_type or "account_billing_error" in err_type:
+            return True
+    except Exception:
+        pass
+    return "credit balance is too low" in str(error).lower()
+
 
 def _log_token_usage(usage) -> None:
     """

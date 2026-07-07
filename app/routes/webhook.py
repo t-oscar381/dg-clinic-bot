@@ -171,6 +171,23 @@ async def _handle_message(body: dict) -> None:
     except Exception:
         pass                                    # Non-critical — don't block
 
+    # ── Unsupported message type (voice, image, etc.) — reply, don't go silent ──
+    if text.startswith("[unsupported:"):
+        msg_type = text.split(":", 1)[1].rstrip("]")
+        if msg_type == "audio":
+            await whatsapp.send_text(
+                sender,
+                "🎤 Maaf, voice message belum bisa diproses saat ini.\n"
+                "Coba ketik pesannya, ya. (Voice note ada di roadmap Phase 2)"
+            )
+        else:
+            await whatsapp.send_text(
+                sender,
+                f"📎 Maaf, tipe pesan ini ({msg_type}) belum didukung.\n"
+                "Coba ketik pesannya sebagai teks."
+            )
+        return
+
     # ── Check pending LOG clarification ──────────────────────────────────────
     if sender in _pending_log:
         await _handle_log_clarification(sender, text)
@@ -194,7 +211,17 @@ async def _handle_message(body: dict) -> None:
 
     # ── Route ─────────────────────────────────────────────────────────────────
     try:
-        if intent.intent == "LOOKUP":
+        if intent.intent == "BILLING_ERROR":
+            # Anthropic credit balance exhausted — tell the doctor plainly
+            # instead of masking it as "the bot didn't understand".
+            await whatsapp.send_text(
+                sender,
+                "⚠️ *Sistem AI sedang tidak aktif* (credit habis).\n"
+                "Pesan ini belum bisa diproses. Hubungi Tommy untuk top-up "
+                "credit Anthropic API secepatnya."
+            )
+
+        elif intent.intent == "LOOKUP":
             await _handle_lookup(sender, intent.patient_name, text)
 
         elif intent.intent == "LOG":
@@ -447,7 +474,12 @@ async def _resolve_and_log_visit(sender: str, extraction: VisitExtraction) -> No
     match = patient_svc.match_patient_from_visit(extraction)
 
     if match.match_tier == "CONFIDENT":
-        await _log_visit_to_patient(sender, match.patient, extraction, is_new=False)
+        # If this visit mentions allergies/medical history/VIP tier that
+        # the existing record doesn't have yet, fill in the gaps — this
+        # is the "append new info to existing patient" behavior requested.
+        # Already-set fields are never overwritten by this step.
+        enriched = patient_svc.enrich_existing_patient(match.patient, extraction)
+        await _log_visit_to_patient(sender, enriched, extraction, is_new=False)
 
     elif match.match_tier == "POSSIBLE":
         _pending_visit_match[sender] = {

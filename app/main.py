@@ -37,10 +37,7 @@ async def health():
     """Railway health check endpoint."""
     return {"status": "ok"}
 
-@app.get("/test-webhook")
-async def test_webhook():
-    return {"status": "received"}
-    
+
 @app.get("/debug-webhook-token")
 async def debug_webhook_token(
     hub_mode: str = None,

@@ -64,29 +64,36 @@ async def send_typing(to: str) -> None:
 def extract_message(body: dict) -> tuple[str, str, str] | None:
     """
     Extract (sender_number, message_id, message_text) from a WhatsApp webhook body.
-    Returns None if the webhook body contains no text message
-    (e.g. status updates, reactions, etc.)
+    Returns None if the webhook body contains no message at all
+    (e.g. status/delivery updates — nothing to reply to).
+
+    For unsupported message types (voice notes, images, documents, etc.),
+    returns a special text placeholder like "[unsupported:audio]" instead
+    of None — this lets the webhook handler send the doctor a clear
+    "not supported yet" reply, rather than silently doing nothing, which
+    looks like the bot is broken rather than the feature being unbuilt.
     """
     try:
         entry   = body["entry"][0]
         changes = entry["changes"][0]
         value   = changes["value"]
 
-        # Ignore status updates (delivery/read receipts)
+        # Ignore status updates (delivery/read receipts) — nothing to reply to
         if "statuses" in value and "messages" not in value:
             return None
 
         message = value["messages"][0]
-
-        # Only handle text messages for now (Phase 2 can add audio/image)
-        if message.get("type") != "text":
-            return None
-
-        sender_number = message["from"]                 # e.g. "628123456789"
+        sender_number = message["from"]
         message_id    = message["id"]
-        message_text  = message["text"]["body"].strip()
+        msg_type      = message.get("type")
 
-        return sender_number, message_id, message_text
+        if msg_type == "text":
+            message_text = message["text"]["body"].strip()
+            return sender_number, message_id, message_text
+
+        # Unsupported type (audio, image, document, video, sticker, etc.)
+        # Voice notes specifically requested for later — see roadmap.
+        return sender_number, message_id, f"[unsupported:{msg_type}]"
 
     except (KeyError, IndexError, TypeError):
         return None

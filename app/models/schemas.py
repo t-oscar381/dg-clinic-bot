@@ -55,6 +55,12 @@ class VisitExtraction(BaseModel):
     Everything else the doctor mentions goes into `extra` as open key-value
     pairs (Cekat-style), stored in JSONB — no schema changes needed as the
     doctor's narration style evolves.
+
+    NOTE: allergies, medical_notes, and vip_tier are CORE (not `extra`)
+    even though they're less common than name/protocol, because the app
+    has dedicated columns and safety-critical UI logic depending on them —
+    specifically, the allergy warning banner on patient lookup only fires
+    if `patient.allergies` is set on the real column, not buried in a note.
     """
     # ── CORE identity — used to match or create the patient ─────────────────
     patient_name: Optional[str] = None
@@ -62,6 +68,9 @@ class VisitExtraction(BaseModel):
     phone: Optional[str] = None
     gender: Optional[str] = None
     dob: Optional[str] = None
+    vip_tier: Optional[str] = None          # Standard|Silver|Gold|Platinum
+    allergies: Optional[str] = None         # safety-critical — always a real column
+    medical_notes: Optional[str] = None     # chronic conditions, contraindications
 
     # ── CORE visit / treatment ────────────────────────────────────────────────
     date: Optional[str] = None
@@ -73,9 +82,8 @@ class VisitExtraction(BaseModel):
     next_visit_date: Optional[str] = None
 
     # ── OPEN catch-all — anything else important the doctor mentioned ────────
-    # e.g. {"location": "Senopati", "payment": "3500000",
-    #       "risk_factors": "travel to Malaysia, possible fever",
-    #       "accompanying": "husband and child", "travel_distance": "15km by car"}
+    # e.g. {"location": "Senopati", "payment_amount": "3500000",
+    #       "risk_factors": "travel to Malaysia", "referral_source": "Sita"}
     extra: dict = {}
 
     is_complete: bool = False

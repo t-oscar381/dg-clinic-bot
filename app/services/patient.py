@@ -166,9 +166,11 @@ def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
     """
     Create a new patient record from visit-narrative identity fields.
     Called when match_patient_from_visit() returns NONE.
-    `referral_source` moved into the open `extra` dict during the schema
-    redesign — read it from there now, since it's no longer a fixed field
-    on VisitExtraction.
+
+    IMPORTANT: allergies, medical_notes, and vip_tier are read from the
+    CORE extraction fields (not `extra`) — these have dedicated columns
+    because format_patient_card() shows a safety-critical allergy warning
+    that only fires if patient.allergies is actually set on this column.
     """
     db = _get_db()
 
@@ -178,8 +180,10 @@ def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
         "dob": extraction.dob,
         "gender": extraction.gender,
         "phone": extraction.phone,
+        "allergies": extraction.allergies,
+        "medical_notes": extraction.medical_notes,
+        "vip_tier": extraction.vip_tier or "Standard",   # explicit default only if not mentioned
         "referral_source": (extraction.extra or {}).get("referral_source"),
-        "vip_tier": "Standard",     # default — doctor can update later
         "is_active": True,
     }
     # Strip None values so Supabase uses column defaults where relevant
@@ -189,6 +193,34 @@ def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
     if result.data:
         return Patient(**result.data[0])
     return None
+
+
+def enrich_existing_patient(patient: Patient, extraction: VisitExtraction) -> Optional[Patient]:
+    """
+    When a visit narrative mentions NEW allergies, medical notes, or VIP
+    tier for a patient who ALREADY EXISTS (confident match), update those
+    fields — but only fill in what's currently missing. This never
+    overwrites an already-set value, since silently replacing verified
+    medical data based on a casual mention is riskier than just leaving
+    a gap for the doctor to fill deliberately via a direct correction.
+    Returns the updated Patient, or the original if nothing changed.
+    """
+    updates = {}
+    if extraction.allergies and not patient.allergies:
+        updates["allergies"] = extraction.allergies
+    if extraction.medical_notes and not patient.medical_notes:
+        updates["medical_notes"] = extraction.medical_notes
+    if extraction.vip_tier and patient.vip_tier == "Standard":
+        updates["vip_tier"] = extraction.vip_tier
+
+    if not updates:
+        return patient
+
+    db = _get_db()
+    result = db.table("patients").update(updates).eq("id", patient.id).execute()
+    if result.data:
+        return Patient(**result.data[0])
+    return patient
 
 
 def find_duplicate_candidates(similarity_threshold: float = 0.4) -> list[dict]:
