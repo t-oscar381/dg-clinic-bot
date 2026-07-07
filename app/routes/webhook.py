@@ -19,7 +19,7 @@ _pending_log: dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GET /webhook — Meta verification
+# GET /webhook — Meta verificationgit add app/routes/webhook.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/webhook")
