@@ -90,6 +90,27 @@ def _names_likely_same(name_a: str, name_b: str) -> bool:
     return False
 
 
+def _log_extraction_to_visit_extraction(log_extraction) -> VisitExtraction:
+    """
+    Converts a LogExtraction into a VisitExtraction so a message classified
+    as LOG (rather than VISIT) can still go through the same match/create
+    pipeline when the patient turns out not to exist yet. LOG and VISIT
+    share the same core treatment fields — only VisitExtraction additionally
+    supports creating a brand-new patient record.
+    """
+    return VisitExtraction(
+        patient_name=log_extraction.patient_name,
+        date=log_extraction.date,
+        protocol=log_extraction.protocol,
+        dosage=log_extraction.dosage,
+        route=log_extraction.route,
+        notes=log_extraction.notes,
+        next_visit_days=log_extraction.next_visit_days,
+        next_visit_date=log_extraction.next_visit_date,
+        is_complete=True,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GET /webhook — Meta verification
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,8 +373,17 @@ async def _save_log_extraction(sender: str, extraction) -> None:
         return
 
     patients, _ = patient_svc.lookup_patient(extraction.patient_name)
+
     if not patients:
-        await whatsapp.send_text(sender, patient_svc.format_not_found(extraction.patient_name))
+        # BUGFIX: previously dead-ended here with "patient not found" —
+        # but a LOG message and a VISIT message describing the exact same
+        # new patient should behave the same way. Whichever intent the
+        # classifier happens to pick, an unknown patient should always be
+        # createable, not silently rejected depending on phrasing.
+        # Convert this LOG extraction into a VisitExtraction and run it
+        # through the same match/create pipeline VISIT uses.
+        visit_extraction = _log_extraction_to_visit_extraction(extraction)
+        await _resolve_and_log_visit(sender, visit_extraction)
         return
 
     best_patient = patients[0]
