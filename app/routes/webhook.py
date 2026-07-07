@@ -5,6 +5,7 @@ POST /webhook  — Incoming WhatsApp messages (every message)
 """
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Query
 from fastapi.responses import PlainTextResponse
+from datetime import datetime, timedelta
 
 from app.config import get_settings
 from app.services import whatsapp, claude_ai, patient as patient_svc
@@ -23,6 +24,62 @@ _pending_log: dict[str, dict] = {}
 # Used when a visit narrative has a POSSIBLE (not confident) patient match
 # and we're waiting on the doctor to pick a number or say "new".
 _pending_visit_match: dict[str, dict] = {}
+
+# ── ACTIVE PATIENT SESSION CACHE ────────────────────────────────────────────────
+# Key: sender_number  Value: {"patient": dict, "updated_at": datetime}
+# Remembers who the doctor was just talking about, so follow-up messages
+# ("gimana dia?", "kasih juga NAD+ minggu depan") don't need the name repeated.
+# Expires after ACTIVE_PATIENT_TTL_MINUTES of inactivity — old context should
+# not silently apply to an unrelated message hours or days later.
+_active_patient: dict[str, dict] = {}
+ACTIVE_PATIENT_TTL_MINUTES = 30
+
+# ── Pending PATIENT SWITCH confirmations ────────────────────────────────────────
+# Key: sender_number  Value: {"extraction": dict, "new_name": str}
+# Used when a message names a patient clearly DIFFERENT from the active
+# cached patient — we ask before writing to make sure we don't log the
+# wrong person's visit against the wrong record.
+_pending_switch: dict[str, dict] = {}
+
+# Words that signal "same patient as before" rather than a new name
+_CONTINUATION_WORDS = {
+    "dia", "nya", "pasien tadi", "yang tadi", "itu", "beliau",
+    "him", "her", "that patient", "the same patient", "he", "she",
+}
+
+
+def _set_active_patient(sender: str, patient: Patient) -> None:
+    _active_patient[sender] = {
+        "patient": patient.model_dump(),
+        "updated_at": datetime.now(),
+    }
+
+
+def _get_active_patient(sender: str) -> Patient | None:
+    """Returns the cached active patient if present and not expired."""
+    entry = _active_patient.get(sender)
+    if not entry:
+        return None
+    age = datetime.now() - entry["updated_at"]
+    if age > timedelta(minutes=ACTIVE_PATIENT_TTL_MINUTES):
+        del _active_patient[sender]
+        return None
+    return Patient(**entry["patient"])
+
+
+def _names_likely_same(name_a: str, name_b: str) -> bool:
+    """
+    Cheap local similarity check (no DB call) to decide whether a mentioned
+    name is probably the same person as the active cached patient, or a
+    clearly different person requiring a switch confirmation.
+    """
+    a, b = name_a.strip().lower(), name_b.strip().lower()
+    if a == b:
+        return True
+    # One name contains the other (e.g. "Sita" vs "Sita Rahardjo")
+    if a in b or b in a:
+        return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -124,6 +181,11 @@ async def _handle_message(body: dict) -> None:
         await _handle_visit_match_reply(sender, text)
         return
 
+    # ── Check pending PATIENT SWITCH confirmation ────────────────────────────
+    if sender in _pending_switch:
+        await _handle_switch_reply(sender, text)
+        return
+
     # ── Intent Classification ─────────────────────────────────────────────────
     intent = claude_ai.classify_intent(text)
 
@@ -163,8 +225,24 @@ async def _handle_message(body: dict) -> None:
 async def _handle_lookup(sender: str, patient_name: str | None, original_text: str) -> None:
     """
     Look up a patient by name and return their profile card.
+    If no name is given (or it's a pronoun/continuation reference like
+    "dia"/"nya"), fall back to the cached active patient from a recent
+    conversation, so the doctor doesn't have to repeat the name.
     """
-    if not patient_name:
+    is_continuation_word = (
+        patient_name and patient_name.strip().lower() in _CONTINUATION_WORDS
+    )
+
+    if not patient_name or is_continuation_word:
+        cached = _get_active_patient(sender)
+        if cached:
+            patients, latest_log = patient_svc.lookup_patient(cached.full_name)
+            if patients:
+                best = patients[0]
+                _set_active_patient(sender, best)   # refresh TTL
+                card = patient_svc.format_patient_card(best, latest_log)
+                await whatsapp.send_text(sender, card)
+                return
         await whatsapp.send_text(
             sender,
             "❓ Siapa yang mau dicek? Tulis nama pasiennya.\nContoh: \"Gimana Sita?\""
@@ -182,8 +260,9 @@ async def _handle_lookup(sender: str, patient_name: str | None, original_text: s
         await whatsapp.send_text(sender, patient_svc.format_multi_match(patients))
         return
 
-    # Best match — show full profile
+    # Best match — show full profile, and remember them as the active patient
     best = patients[0]
+    _set_active_patient(sender, best)
     card = patient_svc.format_patient_card(best, latest_log)
     await whatsapp.send_text(sender, card)
 
@@ -192,22 +271,30 @@ async def _handle_log(sender: str, text: str) -> None:
     """
     Extract treatment data from free-text and save it.
     If data is incomplete, ask a clarifying question and wait for response.
+    Falls back to the active patient cache if no name is mentioned
+    (e.g. a quick follow-up right after a lookup or visit).
     """
     extraction = claude_ai.extract_treatment_log(text)
 
-    # ── Incomplete — ask for missing info ────────────────────────────────────
+    # ── Incomplete — try the active cache before asking ──────────────────────
     if not extraction.is_complete:
-        if extraction.clarification_question:
-            # Store partial extraction to continue on next message
-            _pending_log[sender] = extraction.model_dump()
-            await whatsapp.send_text(sender, extraction.clarification_question)
-        else:
-            await whatsapp.send_text(
-                sender,
-                "❓ Format log kurang lengkap.\n"
-                "Contoh: _Log Sita: Reta 10mg SC hari ini, next 4 weeks_"
-            )
-        return
+        if not extraction.patient_name:
+            cached = _get_active_patient(sender)
+            if cached:
+                extraction.patient_name = cached.full_name
+                extraction.is_complete = bool(extraction.protocol)
+        if not extraction.is_complete:
+            if extraction.clarification_question:
+                # Store partial extraction to continue on next message
+                _pending_log[sender] = extraction.model_dump()
+                await whatsapp.send_text(sender, extraction.clarification_question)
+            else:
+                await whatsapp.send_text(
+                    sender,
+                    "❓ Format log kurang lengkap.\n"
+                    "Contoh: _Log Sita: Reta 10mg SC hari ini, next 4 weeks_"
+                )
+            return
 
     # ── Find patient in DB ────────────────────────────────────────────────────
     if not extraction.patient_name:
@@ -231,6 +318,9 @@ async def _handle_log(sender: str, text: str) -> None:
     if not saved_log:
         await whatsapp.send_text(sender, "⚠️ Gagal save ke database. Coba lagi.")
         return
+
+    # Refresh active patient cache — this is now who we're talking about
+    _set_active_patient(sender, best_patient)
 
     # ── Send confirmation ─────────────────────────────────────────────────────
     confirmation = patient_svc.format_log_confirmation(best_patient, saved_log)
@@ -287,13 +377,36 @@ async def _handle_visit(sender: str, text: str) -> None:
     """
     Doctor described a full visit in narrative form. Steps:
     1. Extract identity + visit details from the narrative (one Claude call)
-    2. If incomplete (no patient name at all) — ask for it
-    3. Try to match against existing patients:
+    2. If incomplete (no patient name at all) — check active cache for a
+       continuation reference, otherwise ask for the name
+    3. If a name IS given and differs from the cached active patient —
+       ask the doctor to confirm before writing (protects against logging
+       to the wrong patient by mistake)
+    4. Otherwise, match against existing patients as before:
        - CONFIDENT match → log visit against that patient directly
        - POSSIBLE match  → ask doctor to confirm which patient (or "new")
        - NONE            → create a new patient, then log the visit
     """
     extraction = claude_ai.extract_visit(text)
+
+    is_continuation_word = (
+        extraction.patient_name
+        and extraction.patient_name.strip().lower() in _CONTINUATION_WORDS
+    )
+
+    # ── No name given, or a pronoun — try the active cache ───────────────────
+    if not extraction.patient_name or is_continuation_word:
+        cached = _get_active_patient(sender)
+        if cached:
+            extraction.patient_name = cached.full_name
+            await _log_visit_to_patient(sender, cached, extraction, is_new=False)
+            return
+        # No cache to fall back on — ask explicitly
+        await whatsapp.send_text(
+            sender,
+            "❓ Pasien siapa yang dimaksud? Sebutkan namanya dulu ya."
+        )
+        return
 
     if not extraction.is_complete:
         question = extraction.clarification_question or (
@@ -302,13 +415,41 @@ async def _handle_visit(sender: str, text: str) -> None:
         await whatsapp.send_text(sender, question)
         return
 
+    # ── A clear name is given — check against the active cache ──────────────
+    cached = _get_active_patient(sender)
+    if cached and not _names_likely_same(cached.full_name, extraction.patient_name):
+        # Clearly a different person than who we were just discussing.
+        # Ask for explicit confirmation before writing anything — this is
+        # the "confirm the ground" step: never silently assume a switch,
+        # and never silently ignore a possible new patient either.
+        _pending_switch[sender] = {
+            "extraction": extraction.model_dump(),
+            "active_patient": cached.model_dump(),
+        }
+        await whatsapp.send_text(
+            sender,
+            f"🔄 Masih tentang *{cached.full_name}*, atau ini pasien baru "
+            f"*{extraction.patient_name}*?\n\n"
+            f"Balas *1* untuk lanjut {cached.full_name}, atau *2* untuk "
+            f"pasien baru {extraction.patient_name}."
+        )
+        return
+
+    await _resolve_and_log_visit(sender, extraction)
+
+
+async def _resolve_and_log_visit(sender: str, extraction: VisitExtraction) -> None:
+    """
+    Shared matching logic used by both the normal VISIT flow and the
+    post-switch-confirmation flow: match against existing patients,
+    then create/log/ask as appropriate.
+    """
     match = patient_svc.match_patient_from_visit(extraction)
 
     if match.match_tier == "CONFIDENT":
         await _log_visit_to_patient(sender, match.patient, extraction, is_new=False)
 
     elif match.match_tier == "POSSIBLE":
-        # Store pending state, ask doctor to confirm
         _pending_visit_match[sender] = {
             "extraction": extraction.model_dump(),
             "candidates": [c.model_dump() for c in match.candidates],
@@ -375,6 +516,8 @@ async def _log_visit_to_patient(
     """
     Shared final step: save the visit as a treatment log against the
     given patient (new or matched), then send the appropriate confirmation.
+    Also refreshes the active-patient cache so follow-up messages
+    ("gimana dia?", "kasih juga NAD+ minggu depan") target the same person.
     """
     from app.models.schemas import LogExtraction
 
@@ -408,6 +551,10 @@ async def _log_visit_to_patient(
             patient.id, log_extraction, extra=extraction.extra
         )
 
+    # Update the active patient cache — this visit's subject becomes
+    # "who we're talking about" for any follow-up messages.
+    _set_active_patient(sender, patient)
+
     if is_new:
         confirmation = patient_svc.format_new_patient_confirmation(patient, saved_log, extraction)
     elif saved_log:
@@ -416,3 +563,38 @@ async def _log_visit_to_patient(
         confirmation = f"✅ Confirmed patient: *{patient.full_name}*\n(No treatment details to log)"
 
     await whatsapp.send_text(sender, confirmation)
+
+
+async def _handle_switch_reply(sender: str, reply_text: str) -> None:
+    """
+    Doctor replied to the "still [Active] or new patient [Name]?" prompt.
+    Reply "1" (or the active patient's name) → continue with cached patient.
+    Reply "2" (or "baru"/"new") → proceed with the newly named patient.
+    """
+    pending = _pending_switch.pop(sender, {})
+    extraction = VisitExtraction(**pending.get("extraction", {}))
+    active_patient = Patient(**pending.get("active_patient", {}))
+
+    reply_clean = reply_text.strip().lower()
+
+    stay_words = {"1", "lanjut", "tetap", "masih", "stay"} | {active_patient.full_name.lower()}
+    switch_words = {"2", "baru", "new", "pasien baru"} | {extraction.patient_name.lower() if extraction.patient_name else ""}
+
+    if reply_clean in stay_words:
+        # Continue logging against the ACTIVE cached patient, keeping the
+        # rest of the extracted visit details (protocol, dosage, etc.)
+        extraction.patient_name = active_patient.full_name
+        await _log_visit_to_patient(sender, active_patient, extraction, is_new=False)
+        return
+
+    if reply_clean in switch_words:
+        await _resolve_and_log_visit(sender, extraction)
+        return
+
+    # Unclear reply — restore pending state and ask again
+    _pending_switch[sender] = pending
+    await whatsapp.send_text(
+        sender,
+        f"❓ Balas *1* untuk {active_patient.full_name}, atau *2* untuk "
+        f"pasien baru {extraction.patient_name}."
+    )
