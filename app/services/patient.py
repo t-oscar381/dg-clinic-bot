@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Optional
 from supabase import create_client, Client
 from app.config import get_settings
-from app.models.schemas import Patient, TreatmentLog, LogExtraction
+from app.models.schemas import Patient, TreatmentLog, LogExtraction, VisitExtraction, PatientMatch
 
 settings = get_settings()
 
@@ -78,6 +78,96 @@ def save_treatment_log(patient_id: str, extraction: LogExtraction) -> Optional[T
     if result.data:
         return TreatmentLog(**result.data[0])
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VISIT WORKFLOW — match existing patient OR create new, then log the visit
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Similarity thresholds for the 3-tier match decision.
+# Tuned conservatively — clinical data should err toward asking, not assuming.
+CONFIDENT_MATCH_THRESHOLD = 0.55   # auto-proceed with this patient
+POSSIBLE_MATCH_THRESHOLD  = 0.25   # ask doctor to confirm which one
+
+
+def match_patient_from_visit(extraction: VisitExtraction) -> PatientMatch:
+    """
+    Given identity details extracted from a visit narrative, decide whether
+    this is:
+      - CONFIDENT : a clear existing match — proceed automatically
+      - POSSIBLE  : one or more plausible matches — ask doctor to confirm
+      - NONE      : no match found — treat as a new patient
+    """
+    if not extraction.patient_name:
+        return PatientMatch(match_tier="NONE")
+
+    db = _get_db()
+    result = db.rpc(
+        "search_patient",
+        {"query": extraction.patient_name, "similarity_threshold": POSSIBLE_MATCH_THRESHOLD},
+    ).execute()
+
+    if not result.data:
+        return PatientMatch(match_tier="NONE")
+
+    candidates = [Patient(**row) for row in result.data]
+    best = candidates[0]
+
+    # Cross-check with phone number if both extraction and record have one —
+    # a phone match is strong secondary confirmation even at lower name similarity
+    phone_confirms = bool(
+        extraction.phone and getattr(best, "phone", None) == extraction.phone
+    )
+
+    if best.similarity >= CONFIDENT_MATCH_THRESHOLD or phone_confirms:
+        return PatientMatch(match_tier="CONFIDENT", patient=best, candidates=candidates)
+
+    return PatientMatch(match_tier="POSSIBLE", candidates=candidates)
+
+
+def create_patient_from_visit(extraction: VisitExtraction) -> Optional[Patient]:
+    """
+    Create a new patient record from visit-narrative identity fields.
+    Called when match_patient_from_visit() returns NONE.
+    """
+    db = _get_db()
+
+    payload = {
+        "full_name": extraction.patient_name,
+        "nickname": extraction.nickname,
+        "dob": extraction.dob,
+        "gender": extraction.gender,
+        "phone": extraction.phone,
+        "referral_source": extraction.referral_source,
+        "vip_tier": "Standard",     # default — doctor can update later
+        "is_active": True,
+    }
+    # Strip None values so Supabase uses column defaults where relevant
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    result = db.table("patients").insert(payload).execute()
+    if result.data:
+        return Patient(**result.data[0])
+    return None
+
+
+def find_duplicate_candidates(similarity_threshold: float = 0.4) -> list[dict]:
+    """
+    Weekly dedupe check: finds pairs of patients whose names are similar
+    enough that they might be the same person entered twice (e.g. once via
+    LOG with a typo, once via a new VISIT). Returns pairs for manual review —
+    this does NOT auto-merge, since merging medical records must be a
+    deliberate doctor decision.
+
+    Call this from a weekly cron/scheduled job and message the doctor
+    a summary of any pairs found.
+    """
+    db = _get_db()
+    result = db.rpc(
+        "find_duplicate_patients",
+        {"similarity_threshold": similarity_threshold},
+    ).execute()
+    return result.data or []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -175,6 +265,53 @@ def format_log_confirmation(patient: Patient, log: TreatmentLog) -> str:
         days = _days_from_today(str(log.next_visit_date))
         lines.append(f"*Next:*    {_format_date(str(log.next_visit_date))} ({days} days)")
     lines.append("\n_/undo to delete the last entry_")
+    return "\n".join(lines)
+
+
+def format_new_patient_confirmation(patient: Patient, log: Optional[TreatmentLog]) -> str:
+    """Confirmation when a brand-new patient was created from a visit narrative."""
+    lines = [
+        "🆕 *New patient created*\n",
+        f"*Name:* {patient.full_name}",
+    ]
+    if patient.nickname:
+        lines.append(f"*Nickname:* {patient.nickname}")
+    if patient.gender:
+        lines.append(f"*Gender:* {patient.gender}")
+    if patient.dob:
+        lines.append(f"*DOB:* {_format_date(str(patient.dob))}")
+
+    if log:
+        lines.append("")
+        lines.append("*— Visit Logged —*")
+        lines.append(f"📌 {log.protocol} {log.dosage or ''} {log.route or ''}".strip())
+        if log.notes:
+            lines.append(f"💬 {log.notes}")
+        if log.next_visit_date:
+            lines.append(f"📅 Next: {_format_date(str(log.next_visit_date))}")
+
+    lines.append("\n_Reply to add more details (VIP tier, allergies, etc.)_")
+    return "\n".join(lines)
+
+
+def format_possible_match(candidates: list[Patient], extraction_summary: str) -> str:
+    """
+    When a visit narrative partially matches existing patients but isn't
+    confident enough to proceed automatically. Ask the doctor to confirm.
+    """
+    lines = [
+        "🤔 *Is this an existing patient?*\n",
+        f"_{extraction_summary}_\n",
+        "Possible matches:",
+    ]
+    for i, p in enumerate(candidates[:3], 1):
+        age = _calculate_age(p.dob) if p.dob else "?"
+        lines.append(f"  {i}. {p.full_name} ({p.gender or '?'}, {age}y) [{p.vip_tier}]")
+
+    lines.append(
+        "\nReply with the *number* to confirm, or say *\"baru\"/\"new\"* "
+        "to create a new patient record."
+    )
     return "\n".join(lines)
 
 

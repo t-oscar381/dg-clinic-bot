@@ -8,6 +8,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.config import get_settings
 from app.services import whatsapp, claude_ai, patient as patient_svc
+from app.models.schemas import VisitExtraction, Patient
 
 settings = get_settings()
 router   = APIRouter()
@@ -16,6 +17,12 @@ router   = APIRouter()
 # Key: sender_number  Value: dict with pending extraction data
 # NOTE: This resets on server restart. Replace with Supabase for production.
 _pending_log: dict[str, dict] = {}
+
+# ── Pending VISIT match confirmations ──────────────────────────────────────────
+# Key: sender_number  Value: {"extraction": dict, "candidates": list[dict]}
+# Used when a visit narrative has a POSSIBLE (not confident) patient match
+# and we're waiting on the doctor to pick a number or say "new".
+_pending_visit_match: dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,7 +82,6 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE MESSAGE HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -113,6 +119,11 @@ async def _handle_message(body: dict) -> None:
         await _handle_log_clarification(sender, text)
         return
 
+    # ── Check pending VISIT match confirmation ───────────────────────────────
+    if sender in _pending_visit_match:
+        await _handle_visit_match_reply(sender, text)
+        return
+
     # ── Intent Classification ─────────────────────────────────────────────────
     intent = claude_ai.classify_intent(text)
 
@@ -126,6 +137,9 @@ async def _handle_message(body: dict) -> None:
 
         elif intent.intent == "LOG":
             await _handle_log(sender, text)
+
+        elif intent.intent == "VISIT":
+            await _handle_visit(sender, text)
 
         elif intent.intent == "HELP" or text.lower() in ("/help", "help"):
             await whatsapp.send_text(sender, patient_svc.format_help())
@@ -263,3 +277,130 @@ async def _handle_log_clarification(sender: str, clarification_text: str) -> Non
             "❓ Masih kurang info. Coba tulis ulang lengkap:\n"
             "_Log [nama]: [protokol] [dosis] [route] hari ini, next [X] weeks_"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VISIT HANDLER — narrative visit → match existing OR create new patient
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _handle_visit(sender: str, text: str) -> None:
+    """
+    Doctor described a full visit in narrative form. Steps:
+    1. Extract identity + visit details from the narrative (one Claude call)
+    2. If incomplete (no patient name at all) — ask for it
+    3. Try to match against existing patients:
+       - CONFIDENT match → log visit against that patient directly
+       - POSSIBLE match  → ask doctor to confirm which patient (or "new")
+       - NONE            → create a new patient, then log the visit
+    """
+    extraction = claude_ai.extract_visit(text)
+
+    if not extraction.is_complete:
+        question = extraction.clarification_question or (
+            "❓ Siapa nama pasiennya? Ceritakan sedikit tentang visit-nya."
+        )
+        await whatsapp.send_text(sender, question)
+        return
+
+    match = patient_svc.match_patient_from_visit(extraction)
+
+    if match.match_tier == "CONFIDENT":
+        await _log_visit_to_patient(sender, match.patient, extraction, is_new=False)
+
+    elif match.match_tier == "POSSIBLE":
+        # Store pending state, ask doctor to confirm
+        _pending_visit_match[sender] = {
+            "extraction": extraction.model_dump(),
+            "candidates": [c.model_dump() for c in match.candidates],
+        }
+        summary = f"{extraction.patient_name} — {extraction.protocol or 'visit'}"
+        await whatsapp.send_text(
+            sender,
+            patient_svc.format_possible_match(match.candidates, summary),
+        )
+
+    else:  # NONE — create new patient
+        new_patient = patient_svc.create_patient_from_visit(extraction)
+        if not new_patient:
+            await whatsapp.send_text(sender, "⚠️ Gagal membuat data pasien baru. Coba lagi.")
+            return
+        await _log_visit_to_patient(sender, new_patient, extraction, is_new=True)
+
+
+async def _handle_visit_match_reply(sender: str, reply_text: str) -> None:
+    """
+    Doctor replied to a "possible match" question with either:
+    - A number (1, 2, 3) picking one of the candidates
+    - "new" / "baru" to create a new patient instead
+    """
+    pending = _pending_visit_match.pop(sender, {})
+    extraction = VisitExtraction(**pending.get("extraction", {}))
+    candidates_data = pending.get("candidates", [])
+
+    reply_clean = reply_text.strip().lower()
+
+    # ── Doctor wants a new patient ────────────────────────────────────────────
+    if reply_clean in ("new", "baru", "pasien baru"):
+        new_patient = patient_svc.create_patient_from_visit(extraction)
+        if not new_patient:
+            await whatsapp.send_text(sender, "⚠️ Gagal membuat data pasien baru. Coba lagi.")
+            return
+        await _log_visit_to_patient(sender, new_patient, extraction, is_new=True)
+        return
+
+    # ── Doctor picked a number ────────────────────────────────────────────────
+    try:
+        choice_idx = int(reply_clean) - 1
+        if 0 <= choice_idx < len(candidates_data):
+            chosen = Patient(**candidates_data[choice_idx])
+            await _log_visit_to_patient(sender, chosen, extraction, is_new=False)
+            return
+    except ValueError:
+        pass
+
+    # ── Unclear reply — put state back and ask again ─────────────────────────
+    _pending_visit_match[sender] = pending
+    await whatsapp.send_text(
+        sender,
+        "❓ Reply dengan nomor pasien, atau ketik *\"baru\"* untuk pasien baru."
+    )
+
+
+async def _log_visit_to_patient(
+    sender: str,
+    patient,
+    extraction: VisitExtraction,
+    is_new: bool,
+) -> None:
+    """
+    Shared final step: save the visit as a treatment log against the
+    given patient (new or matched), then send the appropriate confirmation.
+    """
+    from app.models.schemas import LogExtraction
+
+    # VisitExtraction and LogExtraction share the treatment fields —
+    # reuse save_treatment_log() by converting.
+    log_extraction = LogExtraction(
+        patient_name=patient.full_name,
+        date=extraction.date,
+        protocol=extraction.protocol,
+        dosage=extraction.dosage,
+        route=extraction.route,
+        notes=extraction.notes,
+        next_visit_days=extraction.next_visit_days,
+        next_visit_date=extraction.next_visit_date,
+        is_complete=True,
+    )
+
+    saved_log = None
+    if extraction.protocol:  # only log if there's actually a treatment described
+        saved_log = patient_svc.save_treatment_log(patient.id, log_extraction)
+
+    if is_new:
+        confirmation = patient_svc.format_new_patient_confirmation(patient, saved_log)
+    elif saved_log:
+        confirmation = patient_svc.format_log_confirmation(patient, saved_log)
+    else:
+        confirmation = f"✅ Confirmed patient: *{patient.full_name}*\n(No treatment details to log)"
+
+    await whatsapp.send_text(sender, confirmation)
