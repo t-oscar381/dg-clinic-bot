@@ -36,33 +36,3 @@ async def root():
 async def health():
     """Railway health check endpoint."""
     return {"status": "ok"}
-
-
-@app.get("/debug-webhook-token")
-async def debug_webhook_token(
-    hub_mode: str = None,
-    hub_challenge: str = None,
-    hub_verify_token: str = None,
-):
-    """
-    TEMPORARY DEBUG ENDPOINT — DELETE AFTER FIXING
-    Shows exactly what Meta (or your browser) is sending.
-    """
-    import os
-    actual_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "NOT_SET")
-    
-    return {
-        "received_from_request": {
-            "hub_mode": hub_mode,
-            "hub_challenge": hub_challenge,
-            "hub_verify_token": hub_verify_token,
-            "token_length": len(hub_verify_token) if hub_verify_token else 0,
-            "token_repr": repr(hub_verify_token),  # Shows hidden chars like spaces
-        },
-        "loaded_from_env": {
-            "WHATSAPP_VERIFY_TOKEN": actual_token,
-            "token_length": len(actual_token),
-            "token_repr": repr(actual_token),
-        },
-        "match": hub_verify_token == actual_token if hub_verify_token else False,
-    }

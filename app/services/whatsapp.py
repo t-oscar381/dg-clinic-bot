@@ -5,6 +5,9 @@ Meta Cloud API docs: https://developers.facebook.com/docs/whatsapp/cloud-api
 """
 import hashlib
 import hmac
+from dataclasses import dataclass
+from typing import Optional
+
 import httpx
 from app.config import get_settings
 
@@ -12,6 +15,18 @@ settings = get_settings()
 
 WA_API_VERSION = "v19.0"
 WA_BASE_URL    = f"https://graph.facebook.com/{WA_API_VERSION}"
+
+
+@dataclass
+class IncomingMessage:
+    """One parsed WhatsApp message. `msg_type` selects which fields are set:
+    "text" -> text, "audio" -> media_id, "unsupported" -> unsupported_type."""
+    sender: str
+    message_id: str
+    msg_type: str
+    text: Optional[str] = None
+    media_id: Optional[str] = None
+    unsupported_type: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -61,17 +76,17 @@ async def send_typing(to: str) -> None:
 # WEBHOOK PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_message(body: dict) -> tuple[str, str, str] | None:
+def extract_message(body: dict) -> Optional[IncomingMessage]:
     """
-    Extract (sender_number, message_id, message_text) from a WhatsApp webhook body.
-    Returns None if the webhook body contains no message at all
-    (e.g. status/delivery updates — nothing to reply to).
+    Parse a WhatsApp webhook body into an IncomingMessage.
+    Returns None if the body contains no message at all (e.g. status/delivery
+    updates — nothing to reply to).
 
-    For unsupported message types (voice notes, images, documents, etc.),
-    returns a special text placeholder like "[unsupported:audio]" instead
-    of None — this lets the webhook handler send the doctor a clear
-    "not supported yet" reply, rather than silently doing nothing, which
-    looks like the bot is broken rather than the feature being unbuilt.
+    Audio messages carry the Graph API media id (msg_type="audio") so the
+    caller can run the voice-transcription pipeline. Any other non-text type
+    (image, document, video, sticker, ...) comes back as msg_type="unsupported"
+    with unsupported_type set, so the handler can reply "not supported yet"
+    instead of silently doing nothing.
     """
     try:
         entry   = body["entry"][0]
@@ -88,12 +103,31 @@ def extract_message(body: dict) -> tuple[str, str, str] | None:
         msg_type      = message.get("type")
 
         if msg_type == "text":
-            message_text = message["text"]["body"].strip()
-            return sender_number, message_id, message_text
+            return IncomingMessage(
+                sender=sender_number,
+                message_id=message_id,
+                msg_type="text",
+                text=message["text"]["body"].strip(),
+            )
 
-        # Unsupported type (audio, image, document, video, sticker, etc.)
-        # Voice notes specifically requested for later — see roadmap.
-        return sender_number, message_id, f"[unsupported:{msg_type}]"
+        if msg_type == "audio":
+            media_id = message.get("audio", {}).get("id")
+            if media_id:
+                return IncomingMessage(
+                    sender=sender_number,
+                    message_id=message_id,
+                    msg_type="audio",
+                    media_id=media_id,
+                )
+            # Audio payload with no media id — treat as unsupported rather
+            # than crash the voice pipeline on a missing field.
+
+        return IncomingMessage(
+            sender=sender_number,
+            message_id=message_id,
+            msg_type="unsupported",
+            unsupported_type=msg_type,
+        )
 
     except (KeyError, IndexError, TypeError):
         return None

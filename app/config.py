@@ -13,12 +13,19 @@ class Settings(BaseSettings):
 
     # ── Claude ────────────────────────────────────────────────────────────────
     ANTHROPIC_API_KEY: str = ""
-    CLAUDE_MODEL: str = "claude-sonnet-4-6"
-    MAX_TOKENS_PER_REQUEST: int = 1000
+    CLAUDE_MODEL: str = "claude-sonnet-5"
+    MAX_TOKENS_PER_REQUEST: int = 1024
+    # Sonnet 5 runs adaptive thinking by DEFAULT (extra tokens per call). Off keeps
+    # cost minimal for this structured tool-dispatch bot; flip on if reasoning
+    # quality on tricky messages matters more than token spend.
+    ENABLE_THINKING: bool = False
 
     # ── Supabase ──────────────────────────────────────────────────────────────
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
+
+    # ── Groq (voice-note transcription) ──────────────────────────────────────
+    GROQ_API_KEY: str = ""
 
     # ── App ───────────────────────────────────────────────────────────────────
     CLINIC_NAME: str = "DG Clinic"

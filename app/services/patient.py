@@ -2,7 +2,7 @@
 Patient Service — DG Clinic WhatsApp Bot
 Database operations (Supabase) + WhatsApp response formatting.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from supabase import create_client, Client
 from app.config import get_settings
@@ -69,10 +69,12 @@ def lookup_patient(name_query: str) -> tuple[list[Patient], Optional[dict]]:
     best = patients[0]
 
     # Fetch the latest treatment log for the best match
+    # (excludes soft-deleted rows so an undone visit stops showing as "latest")
     log_result = (
         db.table("treatment_logs")
         .select("*")
         .eq("patient_id", best.id)
+        .is_("deleted_at", "null")
         .order("date", desc=True)
         .limit(1)
         .execute()
@@ -240,6 +242,133 @@ def find_duplicate_candidates(similarity_threshold: float = 0.4) -> list[dict]:
         {"similarity_threshold": similarity_threshold},
     ).execute()
     return result.data or []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT TOOL BACKENDS
+# Pure database operations used by the agentic tool loop (app/services/agent.py).
+# These deliberately DO NOT send WhatsApp messages — the agent composes the reply
+# from the structured results these return.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_patient_with_history(patient_id: str, limit: int = 5) -> tuple[Optional[Patient], list[dict]]:
+    """
+    Fetch one patient by id plus their most recent (non-deleted) treatment logs.
+    Returns (patient, logs) — (None, []) if the patient id is unknown.
+    """
+    db = _get_db()
+    p = db.table("patients").select("*").eq("id", patient_id).limit(1).execute()
+    if not p.data:
+        return None, []
+
+    logs = (
+        db.table("treatment_logs")
+        .select("*")
+        .eq("patient_id", patient_id)
+        .is_("deleted_at", "null")
+        .order("date", desc=True)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return Patient(**p.data[0]), (logs.data or [])
+
+
+def update_patient_fields(patient_id: str, fields: dict) -> Optional[Patient]:
+    """
+    Update explicit patient columns (allergies, medical_notes, vip_tier, phone,
+    nickname, gender, dob, referral_source). None/empty values are dropped so a
+    partial update never blanks an existing field.
+    """
+    allowed = {
+        "full_name", "nickname", "phone", "gender", "dob",
+        "vip_tier", "allergies", "medical_notes", "referral_source",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
+    if not updates:
+        return None
+
+    db = _get_db()
+    result = db.table("patients").update(updates).eq("id", patient_id).execute()
+    return Patient(**result.data[0]) if result.data else None
+
+
+def soft_delete_last_log(patient_id: str) -> Optional[dict]:
+    """
+    Soft-delete the most recent non-deleted treatment log for a patient by
+    stamping deleted_at. Returns the deleted row (for read-back), or None if the
+    patient has no active logs. Soft delete keeps the row for auditability and
+    makes an accidental undo recoverable, per the V2 safety guarantees.
+    """
+    db = _get_db()
+    res = (
+        db.table("treatment_logs")
+        .select("*")
+        .eq("patient_id", patient_id)
+        .is_("deleted_at", "null")
+        .order("date", desc=True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+
+    log = res.data[0]
+    db.table("treatment_logs").update(
+        {"deleted_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", log["id"]).execute()
+    return log
+
+
+def daily_recap(recap_date: Optional[str] = None) -> dict:
+    """
+    Aggregate a day's activity for the evening recap: how many visits, the
+    protocol breakdown, who was seen, and which patients are due for a next
+    visit tomorrow. `recap_date` is YYYY-MM-DD; defaults to today.
+    """
+    day = recap_date or date.today().isoformat()
+    db = _get_db()
+
+    logs = (
+        db.table("treatment_logs")
+        .select("*, patients(full_name, vip_tier)")
+        .eq("date", day)
+        .is_("deleted_at", "null")
+        .execute()
+    ).data or []
+
+    protocol_counts: dict[str, int] = {}
+    patients_seen: list[str] = []
+    for row in logs:
+        proto = row.get("protocol") or "Unspecified"
+        protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
+        name = (row.get("patients") or {}).get("full_name")
+        if name and name not in patients_seen:
+            patients_seen.append(name)
+
+    tomorrow = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    upcoming = (
+        db.table("treatment_logs")
+        .select("next_visit_date, protocol, patients(full_name)")
+        .eq("next_visit_date", tomorrow)
+        .is_("deleted_at", "null")
+        .execute()
+    ).data or []
+
+    return {
+        "date": day,
+        "total_visits": len(logs),
+        "protocol_breakdown": protocol_counts,
+        "patients_seen": patients_seen,
+        "due_tomorrow": [
+            {
+                "patient": (u.get("patients") or {}).get("full_name"),
+                "protocol": u.get("protocol"),
+            }
+            for u in upcoming
+        ],
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -424,6 +553,43 @@ def format_possible_match(candidates: list[Patient], extraction_summary: str) ->
         "\nReply with the *number* to confirm, or say *\"baru\"/\"new\"* "
         "to create a new patient record."
     )
+    return "\n".join(lines)
+
+
+def format_daily_recap(recap: dict) -> str:
+    """
+    WhatsApp-formatted daily recap. This is ONLY ever sent in response to the
+    doctor explicitly asking for it (a "/recap" command or a natural-language
+    request routed through the agent's get_daily_recap tool) — there is no
+    scheduled/automatic recap. The formatted reply itself is the confirmation
+    of what was compiled: the date, the count, and the breakdown.
+    """
+    day_str = _format_date(recap.get("date"))
+    total = recap.get("total_visits", 0)
+
+    lines = [f"📊 *Rekap Hari Ini — {day_str}*\n", f"Total visit: *{total}*"]
+
+    breakdown = recap.get("protocol_breakdown") or {}
+    if breakdown:
+        lines.append("\n*— Protocol —*")
+        for protocol, count in sorted(breakdown.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• {protocol}: {count}")
+
+    patients = recap.get("patients_seen") or []
+    if patients:
+        lines.append("\n*— Pasien —*")
+        lines.append(", ".join(patients))
+
+    due_tomorrow = recap.get("due_tomorrow") or []
+    lines.append("\n*— Besok —*")
+    if due_tomorrow:
+        for item in due_tomorrow:
+            name = item.get("patient") or "?"
+            protocol = item.get("protocol") or ""
+            lines.append(f"🔴 {name} — {protocol}".rstrip(" —"))
+    else:
+        lines.append("_Tidak ada jadwal follow-up besok._")
+
     return "\n".join(lines)
 
 
