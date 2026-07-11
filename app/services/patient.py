@@ -113,6 +113,16 @@ def save_treatment_log(
     if extra:
         payload["extra"] = extra
 
+    # ── Structured revenue — only write money columns when a charge is present,
+    # so a no-charge visit leaves them NULL rather than logging 0/IDR noise. ──
+    if any(v is not None for v in (
+        extraction.amount_treatment, extraction.amount_homecare, extraction.amount_total
+    )):
+        payload["amount_treatment"] = extraction.amount_treatment
+        payload["amount_homecare"] = extraction.amount_homecare
+        payload["amount_total"] = extraction.amount_total
+        payload["currency"] = extraction.currency or "IDR"
+
     result = db.table("treatment_logs").insert(payload).execute()
     if result.data:
         return TreatmentLog(**{k: v for k, v in result.data[0].items() if k != "extra"})
@@ -340,12 +350,25 @@ def daily_recap(recap_date: Optional[str] = None) -> dict:
 
     protocol_counts: dict[str, int] = {}
     patients_seen: list[str] = []
+    revenue_total = 0.0
+    revenue_treatment = 0.0
+    revenue_homecare = 0.0
     for row in logs:
         proto = row.get("protocol") or "Unspecified"
         protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
         name = (row.get("patients") or {}).get("full_name")
         if name and name not in patients_seen:
             patients_seen.append(name)
+
+        # Revenue: trust amount_total when set, otherwise fall back to the sum of
+        # the components (a total-only or split-only visit both aggregate right).
+        t = float(row.get("amount_treatment") or 0)
+        h = float(row.get("amount_homecare") or 0)
+        total = row.get("amount_total")
+        total = float(total) if total is not None else (t + h)
+        revenue_total += total
+        revenue_treatment += t
+        revenue_homecare += h
 
     tomorrow = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
     upcoming = (
@@ -361,6 +384,9 @@ def daily_recap(recap_date: Optional[str] = None) -> dict:
         "total_visits": len(logs),
         "protocol_breakdown": protocol_counts,
         "patients_seen": patients_seen,
+        "revenue_total": revenue_total,
+        "revenue_treatment": revenue_treatment,
+        "revenue_homecare": revenue_homecare,
         "due_tomorrow": [
             {
                 "patient": (u.get("patients") or {}).get("full_name"),
@@ -569,6 +595,18 @@ def format_daily_recap(recap: dict) -> str:
 
     lines = [f"📊 *Rekap Hari Ini — {day_str}*\n", f"Total visit: *{total}*"]
 
+    revenue_total = recap.get("revenue_total") or 0
+    if revenue_total:
+        lines.append(f"\n💰 *Revenue: {_format_rupiah(revenue_total)}*")
+        treatment = recap.get("revenue_treatment") or 0
+        homecare = recap.get("revenue_homecare") or 0
+        # Only show the split when the components were actually recorded.
+        if treatment or homecare:
+            lines.append(
+                f"   _Treatment {_format_rupiah(treatment)} · "
+                f"Homecare {_format_rupiah(homecare)}_"
+            )
+
     breakdown = recap.get("protocol_breakdown") or {}
     if breakdown:
         lines.append("\n*— Protocol —*")
@@ -649,3 +687,11 @@ def _days_from_today(date_str: str) -> int:
         return (d - date.today()).days
     except Exception:
         return 0
+
+
+def _format_rupiah(amount) -> str:
+    """Render a number as Indonesian rupiah, e.g. 850000 -> 'Rp 850.000'."""
+    try:
+        return f"Rp {int(round(float(amount))):,}".replace(",", ".")
+    except (ValueError, TypeError):
+        return f"Rp {amount}"

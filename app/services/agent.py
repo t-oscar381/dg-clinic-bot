@@ -58,7 +58,12 @@ CLINIC CONTEXT
 TOOLS — always act through them; never invent patient data.
 - Look a patient up (search_patient) BEFORE answering about them or writing to
   their record. Never answer from memory of a patient you have not looked up.
-- To record a visit, use log_visit. To fix patient details, use update_patient.
+- To record a visit, use log_visit. If the doctor mentions payment, capture it
+  in log_visit's amount fields (treatment vs homecare fee split when he gives
+  both; otherwise the lump-sum total). Normalize rupiah shorthand to plain
+  digits: "600 ribu" -> 600000, "3.5 juta" -> 3500000. Include the amount in
+  your read-back so he can confirm the money too. To fix patient details, use
+  update_patient.
 - To reverse the last logged visit, use undo_last_visit.
 - Use get_daily_recap ONLY when the doctor explicitly asks for a summary of
   the day (e.g. "gimana hari ini?", "rekap dong"). Never call it on your own
@@ -148,6 +153,26 @@ TOOLS = [
                 "date": {"type": "string", "description": "Visit date YYYY-MM-DD; defaults to today"},
                 "notes": {"type": "string"},
                 "next_visit_days": {"type": "integer", "description": "Days until the next visit, if mentioned"},
+                "amount_treatment": {
+                    "type": "number",
+                    "description": (
+                        "Treatment/meds cost in rupiah, plain digits. Normalize "
+                        "shorthand: '600 ribu' -> 600000, '3.5 juta' -> 3500000."
+                    ),
+                },
+                "amount_homecare": {
+                    "type": "number",
+                    "description": "Separate homecare/travel fee in rupiah, plain digits (normalize as above).",
+                },
+                "amount_total": {
+                    "type": "number",
+                    "description": (
+                        "Total billed in rupiah, plain digits. Send this when the "
+                        "doctor gives only a lump sum with no treatment/homecare "
+                        "split. If you send the two components, you may omit this "
+                        "— it is summed for you."
+                    ),
+                },
             },
             "required": ["protocol"],
         },
@@ -278,6 +303,15 @@ def _execute_tool(name: str, tool_input: dict) -> dict:
         else:
             return {"error": "Provide either patient_id (existing) or new_patient.full_name."}
 
+        # Revenue: if the doctor gave the split but no total, sum it; if only a
+        # total, keep components null. Currency defaults to IDR when any charge.
+        amt_t = tool_input.get("amount_treatment")
+        amt_h = tool_input.get("amount_homecare")
+        amt_total = tool_input.get("amount_total")
+        if amt_total is None and (amt_t is not None or amt_h is not None):
+            amt_total = (amt_t or 0) + (amt_h or 0)
+        has_payment = amt_total is not None
+
         log = LogExtraction(
             patient_name=patient.full_name,
             date=visit_date,
@@ -287,6 +321,10 @@ def _execute_tool(name: str, tool_input: dict) -> dict:
             notes=tool_input.get("notes"),
             next_visit_days=tool_input.get("next_visit_days"),
             next_visit_date=nvd,
+            amount_treatment=amt_t,
+            amount_homecare=amt_h,
+            amount_total=amt_total,
+            currency="IDR" if has_payment else None,
             is_complete=True,
         )
         saved = patient_svc.save_treatment_log(patient.id, log)
@@ -304,6 +342,10 @@ def _execute_tool(name: str, tool_input: dict) -> dict:
             "route": saved.route,
             "date": str(saved.date),
             "next_visit_date": str(saved.next_visit_date) if saved.next_visit_date else None,
+            "amount_treatment": saved.amount_treatment,
+            "amount_homecare": saved.amount_homecare,
+            "amount_total": saved.amount_total,
+            "currency": saved.currency,
         }
 
     if name == "update_patient":

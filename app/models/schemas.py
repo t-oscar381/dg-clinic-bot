@@ -25,6 +25,11 @@ class TreatmentLog(BaseModel):
     notes: Optional[str] = None
     next_visit_date: Optional[date] = None
     logged_by: str = "doctor"
+    # ── Structured revenue (V2 payments) ──────────────────────────────────────
+    amount_treatment: Optional[float] = None    # meds / procedure cost
+    amount_homecare: Optional[float] = None      # travel / homecare fee
+    amount_total: Optional[float] = None         # authoritative billed total
+    currency: Optional[str] = None               # "IDR" when a charge is recorded
 
 
 class IntentResult(BaseModel):
@@ -43,6 +48,11 @@ class LogExtraction(BaseModel):
     notes: Optional[str] = None
     next_visit_days: Optional[int] = None
     next_visit_date: Optional[str] = None
+    # ── Structured revenue (V2 payments) — plain rupiah digits ────────────────
+    amount_treatment: Optional[float] = None
+    amount_homecare: Optional[float] = None
+    amount_total: Optional[float] = None
+    currency: Optional[str] = None
     is_complete: bool = False
     missing_fields: list[str] = []
     clarification_question: Optional[str] = None

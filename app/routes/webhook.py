@@ -98,7 +98,15 @@ async def _handle_message(body: dict) -> None:
 
     # ── Security gate — only the registered doctor may use this bot ───────────
     if parsed.sender != settings.DOCTOR_WHATSAPP_NUMBER:
-        return                                  # silently drop; don't reveal the bot
+        # Still a silent drop toward the SENDER (never reveal the bot exists),
+        # but log it server-side — a mis-configured DOCTOR_WHATSAPP_NUMBER
+        # otherwise looks identical to "no messages arriving at all".
+        print(
+            f"[gate] dropped message from {parsed.sender} "
+            f"(expected {settings.DOCTOR_WHATSAPP_NUMBER})",
+            file=sys.stderr, flush=True,
+        )
+        return
 
     try:
         await whatsapp.mark_as_read(parsed.message_id)
