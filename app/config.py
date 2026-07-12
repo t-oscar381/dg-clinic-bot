@@ -8,8 +8,21 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_VERIFY_TOKEN: str = "dg_clinic_verify"
     WHATSAPP_APP_SECRET: str = ""
-    # Doctor's number in E.164 format WITHOUT the +  e.g. "628123456789"
+    # Authorized doctor number(s), comma-separated, E.164 digits.
+    # One value or several: "628119856889" or "628119856889,628123456789".
+    # No hard cap — the env var itself is the access-control surface.
     DOCTOR_WHATSAPP_NUMBER: str = ""
+
+    @property
+    def doctor_numbers(self) -> frozenset[str]:
+        """Parsed allowlist. Tolerates '+', spaces, and dashes in the env value —
+        Meta delivers senders as bare digits, and a pasted '+62 811-...' silently
+        failing the equality gate is exactly the config bug this prevents."""
+        cleaned = (
+            n.strip().lstrip("+").replace(" ", "").replace("-", "")
+            for n in self.DOCTOR_WHATSAPP_NUMBER.split(",")
+        )
+        return frozenset(n for n in cleaned if n)
 
     # ── Claude ────────────────────────────────────────────────────────────────
     ANTHROPIC_API_KEY: str = ""

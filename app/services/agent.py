@@ -249,8 +249,10 @@ def _next_visit_date(date_str: str | None, next_visit_days: int | None) -> str |
     return (base + timedelta(days=next_visit_days)).isoformat()
 
 
-def _execute_tool(name: str, tool_input: dict) -> dict:
-    """Dispatch one tool call to the patient service. Returns a JSON-able dict."""
+def _execute_tool(name: str, tool_input: dict, sender: str = "doctor") -> dict:
+    """Dispatch one tool call to the patient service. Returns a JSON-able dict.
+    `sender` is the authenticated doctor's wa_number, injected server-side from
+    the webhook gate — never taken from the model — and used for authorship."""
     if name == "search_patient":
         patients, _ = patient_svc.lookup_patient(tool_input["query"])
         return {"matches": [_patient_brief(p) for p in patients]}
@@ -327,7 +329,7 @@ def _execute_tool(name: str, tool_input: dict) -> dict:
             currency="IDR" if has_payment else None,
             is_complete=True,
         )
-        saved = patient_svc.save_treatment_log(patient.id, log)
+        saved = patient_svc.save_treatment_log(patient.id, log, logged_by=sender)
         if not saved:
             return {"error": "Failed to save the treatment log."}
 
@@ -420,7 +422,7 @@ def run_agent(sender: str, user_text: str) -> str:
                 for block in response.content:
                     if block.type == "tool_use":
                         try:
-                            result = _execute_tool(block.name, block.input or {})
+                            result = _execute_tool(block.name, block.input or {}, sender)
                         except Exception as e:            # never let one tool kill the turn
                             if settings.DEBUG:
                                 print(f"[agent] tool {block.name} error: {e}")

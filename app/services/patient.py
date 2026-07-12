@@ -92,11 +92,14 @@ def save_treatment_log(
     patient_id: str,
     extraction: LogExtraction,
     extra: Optional[dict] = None,
+    logged_by: str = "doctor",
 ) -> Optional[TreatmentLog]:
     """
     Insert a new treatment log row and return the saved record.
     `extra` is an OPEN dict (Cekat-style) for anything the doctor mentioned
     that doesn't fit a fixed column — stored as JSONB, no schema change needed.
+    `logged_by` records WHICH doctor (wa_number) wrote the entry — with several
+    doctors sharing one patient pool, authorship is part of the medical record.
     """
     db = _get_db()
 
@@ -108,7 +111,7 @@ def save_treatment_log(
         "route": extraction.route,
         "notes": extraction.notes,
         "next_visit_date": extraction.next_visit_date,
-        "logged_by": "doctor",
+        "logged_by": logged_by,
     }
     if extra:
         payload["extra"] = extra

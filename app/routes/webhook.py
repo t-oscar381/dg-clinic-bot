@@ -96,14 +96,17 @@ async def _handle_message(body: dict) -> None:
     if not parsed:
         return                                  # status update / nothing to reply to
 
-    # ── Security gate — only the registered doctor may use this bot ───────────
-    if parsed.sender != settings.DOCTOR_WHATSAPP_NUMBER:
+    # ── Security gate — only registered doctors may use this bot ──────────────
+    # DOCTOR_WHATSAPP_NUMBER may hold several comma-separated numbers; each
+    # doctor gets an isolated conversation session automatically because
+    # memory is keyed by sender (they share the clinic's patient pool).
+    if parsed.sender not in settings.doctor_numbers:
         # Still a silent drop toward the SENDER (never reveal the bot exists),
         # but log it server-side — a mis-configured DOCTOR_WHATSAPP_NUMBER
         # otherwise looks identical to "no messages arriving at all".
         print(
             f"[gate] dropped message from {parsed.sender} "
-            f"(expected {settings.DOCTOR_WHATSAPP_NUMBER})",
+            f"(allowed: {sorted(settings.doctor_numbers) or 'NONE CONFIGURED'})",
             file=sys.stderr, flush=True,
         )
         return
