@@ -69,6 +69,13 @@ TOOLS — always act through them; never invent patient data.
   the day (e.g. "gimana hari ini?", "rekap dong"). Never call it on your own
   initiative or as part of another task — there is no scheduled recap; it is
   always the doctor asking, right now. (He can also type "/recap" directly.)
+- PAYMENT SCREENSHOTS: when a message says the doctor sent a payment
+  screenshot (bukti transfer), the image is already stored — your job is to
+  attach it to the right visit with attach_payment_proof. Work out WHICH
+  patient from the conversation (usually the one just discussed); if unclear,
+  ask before attaching. Read back what the screenshot showed (amount, bank)
+  and where you attached it. If the visit already has a different amount
+  logged than the screenshot shows, say so plainly — never silently adjust.
 
 SAFETY — these are non-negotiable for a clinical tool:
 1. CONFIRM IDENTITY BEFORE WRITING. Before log_visit / update_patient, make sure
@@ -208,6 +215,27 @@ TOOLS = [
         },
     },
     {
+        "name": "attach_payment_proof",
+        "description": (
+            "Attach the payment screenshot the doctor just sent to a patient's "
+            "most recent visit, as proof of payment. Only available when the "
+            "current message included a screenshot. If the visit has no amounts "
+            "recorded yet, you may pass the amounts read from the screenshot to "
+            "fill them (never overwrites amounts already logged). Confirm which "
+            "patient it belongs to from the conversation — ask if unclear."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "patient_id": {"type": "string", "description": "From search_patient"},
+                "amount_treatment": {"type": "number", "description": "Rupiah digits, only if read from the screenshot"},
+                "amount_homecare": {"type": "number", "description": "Rupiah digits, only if read from the screenshot"},
+                "amount_total": {"type": "number", "description": "Rupiah digits, only if read from the screenshot"},
+            },
+            "required": ["patient_id"],
+        },
+    },
+    {
         "name": "get_daily_recap",
         "description": (
             "Summarise a day's activity: number of visits, protocol breakdown, "
@@ -249,10 +277,14 @@ def _next_visit_date(date_str: str | None, next_visit_days: int | None) -> str |
     return (base + timedelta(days=next_visit_days)).isoformat()
 
 
-def _execute_tool(name: str, tool_input: dict, sender: str = "doctor") -> dict:
+def _execute_tool(
+    name: str, tool_input: dict, sender: str = "doctor", proof_path: str | None = None
+) -> dict:
     """Dispatch one tool call to the patient service. Returns a JSON-able dict.
-    `sender` is the authenticated doctor's wa_number, injected server-side from
-    the webhook gate — never taken from the model — and used for authorship."""
+    `sender` (authenticated doctor's wa_number) and `proof_path` (storage path
+    of a screenshot received THIS turn) are injected server-side — never taken
+    from the model, so a prompt-injected message can't forge authorship or
+    attach an arbitrary path."""
     if name == "search_patient":
         patients, _ = patient_svc.lookup_patient(tool_input["query"])
         return {"matches": [_patient_brief(p) for p in patients]}
@@ -369,6 +401,21 @@ def _execute_tool(name: str, tool_input: dict, sender: str = "doctor") -> dict:
             "date": removed.get("date"),
         }
 
+    if name == "attach_payment_proof":
+        if not proof_path:
+            return {"error": "No screenshot was received with this message — nothing to attach."}
+        amounts = {
+            k: tool_input.get(k)
+            for k in ("amount_treatment", "amount_homecare", "amount_total")
+            if tool_input.get(k) is not None
+        }
+        result = patient_svc.attach_payment_proof(
+            tool_input["patient_id"], proof_path, amounts or None
+        )
+        if not result:
+            return {"error": "That patient has no visit to attach the proof to — log the visit first."}
+        return {"attached": True, **result}
+
     if name == "get_daily_recap":
         return patient_svc.daily_recap(tool_input.get("date"))
 
@@ -385,11 +432,12 @@ def _thinking_param() -> dict:
     return {"type": "adaptive"} if settings.ENABLE_THINKING else {"type": "disabled"}
 
 
-def run_agent(sender: str, user_text: str) -> str:
+def run_agent(sender: str, user_text: str, proof_path: str | None = None) -> str:
     """
     Run one full agentic turn for the doctor's message and return the reply text.
     Drives the call → tool → call cycle with the Anthropic Messages API, capped at
-    MAX_ITERATIONS tool rounds.
+    MAX_ITERATIONS tool rounds. `proof_path` is set when this turn's message was a
+    payment screenshot (already stored) — it enables the attach_payment_proof tool.
     """
     # Cache the stable prefix (tools render before system, so a cache_control on
     # the system block caches tools+system together). The date makes it stable
@@ -422,7 +470,7 @@ def run_agent(sender: str, user_text: str) -> str:
                 for block in response.content:
                     if block.type == "tool_use":
                         try:
-                            result = _execute_tool(block.name, block.input or {}, sender)
+                            result = _execute_tool(block.name, block.input or {}, sender, proof_path)
                         except Exception as e:            # never let one tool kill the turn
                             if settings.DEBUG:
                                 print(f"[agent] tool {block.name} error: {e}")

@@ -23,7 +23,7 @@ from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Query
 from fastapi.responses import PlainTextResponse
 
 from app.config import get_settings
-from app.services import whatsapp, agent, voice, patient as patient_svc
+from app.services import whatsapp, agent, voice, media, proof, patient as patient_svc
 
 # Exact-match trigger phrases (case-insensitive, trimmed) for the recap
 # fast path. Deliberately a small fixed set — anything else ("rekap kemarin",
@@ -126,6 +126,9 @@ async def _handle_message(body: dict) -> None:
         elif parsed.msg_type == "audio":
             await _handle_voice_note(parsed.sender, parsed.media_id)
 
+        elif parsed.msg_type == "image":
+            await _handle_payment_proof(parsed.sender, parsed.media_id, parsed.text)
+
         else:
             await _reply_unsupported(parsed.sender, parsed.unsupported_type)
 
@@ -175,6 +178,39 @@ async def _handle_voice_note(sender: str, media_id: str) -> None:
 
     await whatsapp.send_text(sender, f"🎤 Saya dengar: _{transcript}_")
     await _run_agent_and_reply(sender, transcript)
+
+
+async def _handle_payment_proof(sender: str, media_id: str, caption: str | None) -> None:
+    """
+    Payment-screenshot pipeline: download -> store in the private bucket ->
+    read with Claude vision -> hand to the agent as text. The agent decides
+    which visit it belongs to (from conversation context), attaches it, and
+    reads back what the screenshot showed — mirroring the voice-note pattern
+    of extract-then-confirm before anything touches a record.
+    """
+    try:
+        image_bytes, mime_type = await media.fetch_media(media_id)
+        proof_path = proof.store_proof(image_bytes, mime_type, sender)
+        extracted = proof.read_payment_screenshot(image_bytes, mime_type)
+    except (media.MediaError, proof.ProofError) as e:
+        if settings.DEBUG:
+            print(f"[proof] failed: {e}", file=sys.stderr, flush=True)
+        await whatsapp.send_text(
+            sender,
+            "📸 Maaf, gambar ini tidak bisa diproses. Coba kirim ulang "
+            "screenshot-nya, atau ketik detail pembayarannya."
+        )
+        return
+
+    synthetic = (
+        "[The doctor sent a payment screenshot. It is already stored as proof. "
+        f"What it shows: {extracted}]"
+    )
+    if caption:
+        synthetic += f"\nDoctor's caption: {caption}"
+
+    reply = agent.run_agent(sender, synthetic, proof_path=proof_path)
+    await whatsapp.send_text(sender, reply)
 
 
 async def _reply_unsupported(sender: str, msg_type: str | None) -> None:

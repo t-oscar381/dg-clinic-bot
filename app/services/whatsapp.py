@@ -20,7 +20,8 @@ WA_BASE_URL    = f"https://graph.facebook.com/{WA_API_VERSION}"
 @dataclass
 class IncomingMessage:
     """One parsed WhatsApp message. `msg_type` selects which fields are set:
-    "text" -> text, "audio" -> media_id, "unsupported" -> unsupported_type."""
+    "text" -> text, "audio" -> media_id, "image" -> media_id (+ text = caption
+    if any), "unsupported" -> unsupported_type."""
     sender: str
     message_id: str
     msg_type: str
@@ -121,6 +122,18 @@ def extract_message(body: dict) -> Optional[IncomingMessage]:
                 )
             # Audio payload with no media id — treat as unsupported rather
             # than crash the voice pipeline on a missing field.
+
+        if msg_type == "image":
+            image = message.get("image", {})
+            media_id = image.get("id")
+            if media_id:
+                return IncomingMessage(
+                    sender=sender_number,
+                    message_id=message_id,
+                    msg_type="image",
+                    media_id=media_id,
+                    text=(image.get("caption") or "").strip() or None,
+                )
 
         return IncomingMessage(
             sender=sender_number,

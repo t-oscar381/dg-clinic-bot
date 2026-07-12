@@ -334,6 +334,55 @@ def soft_delete_last_log(patient_id: str) -> Optional[dict]:
     return log
 
 
+def attach_payment_proof(
+    patient_id: str,
+    proof_path: str,
+    amounts: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Attach a stored payment-screenshot path to the patient's most recent
+    non-deleted visit. If `amounts` is given (amount_treatment/homecare/total),
+    ONLY fills fields that are currently NULL — a screenshot never silently
+    overwrites an amount the doctor already logged; mismatches are for the
+    doctor to resolve, not the bot.
+    Returns a summary of the updated row, or None if the patient has no visits.
+    """
+    db = _get_db()
+    res = (
+        db.table("treatment_logs")
+        .select("id, date, protocol, amount_treatment, amount_homecare, amount_total")
+        .eq("patient_id", patient_id)
+        .is_("deleted_at", "null")
+        .order("date", desc=True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return None
+
+    log = res.data[0]
+    updates: dict = {"payment_proof_path": proof_path}
+    filled = []
+    for field in ("amount_treatment", "amount_homecare", "amount_total"):
+        val = (amounts or {}).get(field)
+        if val is not None and log.get(field) is None:
+            updates[field] = val
+            filled.append(field)
+    if filled:
+        updates["currency"] = "IDR"
+
+    db.table("treatment_logs").update(updates).eq("id", log["id"]).execute()
+    return {
+        "log_id": log["id"],
+        "date": log["date"],
+        "protocol": log["protocol"],
+        "proof_path": proof_path,
+        "amounts_filled": filled,
+        "existing_amount_total": log.get("amount_total"),
+    }
+
+
 def daily_recap(recap_date: Optional[str] = None) -> dict:
     """
     Aggregate a day's activity for the evening recap: how many visits, the
