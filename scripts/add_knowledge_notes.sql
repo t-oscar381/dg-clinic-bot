@@ -29,3 +29,21 @@ CREATE TABLE IF NOT EXISTS knowledge_notes (
 CREATE INDEX IF NOT EXISTS idx_knowledge_notes_author
     ON knowledge_notes (author_wa_number, created_at DESC)
     WHERE deleted_at IS NULL;
+
+-- ── Row Level Security ────────────────────────────────────────────────────────
+-- The bot writes with the service_role key (bypasses RLS). The admin page reads
+-- with the anon key + the signed-in admin's JWT, so it needs the same
+-- admins-allowlist policy the `posts` table uses. Read + update (soft-delete
+-- sets deleted_at, and future edits set revised_at) for signed-in admins only.
+ALTER TABLE knowledge_notes ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "admins read knowledge" ON knowledge_notes;
+CREATE POLICY "admins read knowledge" ON knowledge_notes
+    FOR SELECT TO authenticated
+    USING ((auth.jwt() ->> 'email') IN (SELECT email FROM admins));
+
+DROP POLICY IF EXISTS "admins update knowledge" ON knowledge_notes;
+CREATE POLICY "admins update knowledge" ON knowledge_notes
+    FOR UPDATE TO authenticated
+    USING ((auth.jwt() ->> 'email') IN (SELECT email FROM admins))
+    WITH CHECK ((auth.jwt() ->> 'email') IN (SELECT email FROM admins));
