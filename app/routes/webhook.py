@@ -23,7 +23,9 @@ from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Query
 from fastapi.responses import PlainTextResponse
 
 from app.config import get_settings
-from app.services import whatsapp, agent, voice, media, proof, patient as patient_svc
+from app.services import (
+    whatsapp, agent, voice, media, proof, knowledge, patient as patient_svc,
+)
 
 # Exact-match trigger phrases (case-insensitive, trimmed) for the recap
 # fast path. Deliberately a small fixed set — anything else ("rekap kemarin",
@@ -96,17 +98,17 @@ async def _handle_message(body: dict) -> None:
     if not parsed:
         return                                  # status update / nothing to reply to
 
-    # ── Security gate — only registered doctors may use this bot ──────────────
-    # DOCTOR_WHATSAPP_NUMBER may hold several comma-separated numbers; each
-    # doctor gets an isolated conversation session automatically because
-    # memory is keyed by sender (they share the clinic's patient pool).
-    if parsed.sender not in settings.doctor_numbers:
+    # ── Security gate — only authorized numbers may use this bot ──────────────
+    # allowed_numbers = doctors (patient CRM) ∪ knowledge-mode users. Each doctor
+    # gets an isolated session (memory is keyed by sender). Knowledge-mode numbers
+    # are routed to the note handler instead of the CRM agent.
+    if parsed.sender not in settings.allowed_numbers:
         # Still a silent drop toward the SENDER (never reveal the bot exists),
-        # but log it server-side — a mis-configured DOCTOR_WHATSAPP_NUMBER
-        # otherwise looks identical to "no messages arriving at all".
+        # but log it server-side — a mis-configured allowlist otherwise looks
+        # identical to "no messages arriving at all".
         print(
             f"[gate] dropped message from {parsed.sender} "
-            f"(allowed: {sorted(settings.doctor_numbers) or 'NONE CONFIGURED'})",
+            f"(allowed: {sorted(settings.allowed_numbers) or 'NONE CONFIGURED'})",
             file=sys.stderr, flush=True,
         )
         return
@@ -116,8 +118,13 @@ async def _handle_message(body: dict) -> None:
     except Exception:
         pass                                    # non-critical
 
+    is_knowledge = parsed.sender in settings.knowledge_numbers
+
     try:
-        if parsed.msg_type == "text":
+        if is_knowledge:
+            await _handle_knowledge(parsed)
+
+        elif parsed.msg_type == "text":
             if parsed.text.strip().lower() in _RECAP_TRIGGERS:
                 await _send_daily_recap(parsed.sender)
             else:
@@ -140,6 +147,46 @@ async def _handle_message(body: dict) -> None:
 async def _run_agent_and_reply(sender: str, text: str) -> None:
     reply = agent.run_agent(sender, text)
     await whatsapp.send_text(sender, reply)
+
+
+async def _handle_knowledge(parsed) -> None:
+    """
+    Knowledge-mode routing (Dr. Denish's second brain). Text and voice become
+    notes; a leading "cari catatan …" searches instead. Voice is transcribed and
+    echoed first (same safety as CRM voice), then captured. Images/other types
+    aren't note material yet.
+    """
+    if parsed.msg_type == "text":
+        text = parsed.text
+        if knowledge.is_search(text):
+            await whatsapp.send_text(parsed.sender, knowledge.search_notes(parsed.sender, text))
+        else:
+            await whatsapp.send_text(parsed.sender, knowledge.capture_note(parsed.sender, text, "text"))
+        return
+
+    if parsed.msg_type == "audio":
+        try:
+            transcript = await voice.transcribe_voice_note(parsed.media_id)
+        except voice.TranscriptionError as e:
+            if settings.DEBUG:
+                print(f"[knowledge] voice transcription failed: {e}")
+            await whatsapp.send_text(
+                parsed.sender,
+                "🎤 Maaf, voice note-nya tidak bisa diproses. Coba kirim ulang."
+            )
+            return
+        await whatsapp.send_text(parsed.sender, f"🎤 Saya dengar: _{transcript}_")
+        if knowledge.is_search(transcript):
+            await whatsapp.send_text(parsed.sender, knowledge.search_notes(parsed.sender, transcript))
+        else:
+            await whatsapp.send_text(parsed.sender, knowledge.capture_note(parsed.sender, transcript, "voice"))
+        return
+
+    await whatsapp.send_text(
+        parsed.sender,
+        "📎 Untuk knowledge bank, kirim teks atau voice note ya. "
+        "(gambar/file belum didukung)"
+    )
 
 
 async def _send_daily_recap(sender: str) -> None:
